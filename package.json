@@ -1,0 +1,68 @@
+{
+  "name": "sfu-server",
+  "version": "0.1.0",
+  "description": "Selective Forwarding Unit for Node.js. Multi-party WebRTC routing with no native bindings, no C++ toolchain, and a complete mediasoup v3 server API as a drop-in.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "webrtc-server": "^0.6.7",
+    "rtp-packet": "^0.4.2"
+  },
+  "keywords": [
+    "webrtc",
+    "sfu",
+    "media-server",
+    "mediasoup",
+    "mediasoup-compat",
+    "mediasoup-alternative",
+    "video-conferencing",
+    "video-call",
+    "voice-call",
+    "streaming",
+    "broadcast",
+    "rtp",
+    "srtp",
+    "simulcast",
+    "datachannel",
+    "sctp",
+    "vp8",
+    "vp9",
+    "h264",
+    "h265",
+    "av1",
+    "opus",
+    "pure-javascript",
+    "no-native",
+    "no-bindings"
+  ],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/sfu-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/sfu-server/issues"
+  },
+  "homepage": "https://github.com/colocohen/sfu-server#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ]
+}
