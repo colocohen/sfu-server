@@ -965,13 +965,13 @@ function Consumer(opts) {
     // the producer again inside this window. Ours is honoured on the
     // Producer that owns the delay, so several consumers of one producer
     // cannot combine into a PLI storm.
-    var prod = router._producerById(state.producerId);
+    var prod = state.transport._router._producerById(state.producerId);
     if (prod && prod._kfDelay > 0) {
       var nowKf = Date.now();
       if (prod._lastKfAt && nowKf - prod._lastKfAt < prod._kfDelay) return Promise.resolve();
       prod._lastKfAt = nowKf;
     }
-    var pr = router._producerById(state.producerId);
+    var pr = state.transport._router._producerById(state.producerId);
     _diag('consumer ' + state.id.slice(0, 8) + ' requestKeyFrame: producer=' +
           (pr ? 'found' : 'MISSING') + ' handle=' + (pr && pr._sfuHandle() ? 'yes' : 'NO'));
     if (state.closed) return Promise.resolve();
