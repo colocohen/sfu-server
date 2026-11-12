@@ -888,8 +888,12 @@ function Consumer(opts) {
     // attributed). Flow is therefore a CONDITION over three inputs —
     // paused, producerPaused, AND the transport's dtlsState — re-applied
     // whenever any of them changes, not an action taken at resume() time.
-    var shouldFlow = !state.paused && !state.producerPaused &&
-                     state.transport.dtlsState === 'connected';
+    // Plain and pipe transports have no DTLS: their third input is the
+    // remote in their tuple, without which send() drops every packet.
+    var t = state.transport;
+    var canCarry = t.type === 'webrtc' ? t.dtlsState === 'connected'
+                                       : t.tuple.remotePort !== undefined;
+    var shouldFlow = !state.paused && !state.producerPaused && canCarry;
     try {
       if (shouldFlow) state.sfuHandle.resume();
       else            state.sfuHandle.pause();
@@ -914,7 +918,7 @@ function Consumer(opts) {
     }
     state.wasFlowing = shouldFlow;
   }
-  this._applyFlow = apply_flow;   // transport re-applies on dtlsstatechange
+  this._applyFlow = apply_flow;   // transport re-applies once it can carry media
 
   this.pause = function () {
     if (state.closed || state.paused) return Promise.resolve();
@@ -3047,8 +3051,7 @@ function Router(options) {
   // outgoing ssrc/pt the app writes into the SDP it feeds ffmpeg, and
   // the engine treats the socket as a peer, so producer churn, layer
   // switching and keyframe debt apply unchanged. Ingress (ffmpeg →
-  // router) is not implemented yet and says so loudly rather than
-  // accepting a produce() that would silently carry nothing.
+  // router) is produce(), routed by the ssrc the app declares.
   this.createPlainTransport = function (options) {
     return createPlainLike(options, 'plain');
   };
@@ -3259,8 +3262,16 @@ function Router(options) {
                 ' comedia: learned remote ' + rinfo.address + ':' + rinfo.port);
           tobs.emit('tuple', tstate.tuple);
           tev.emit('tuple', tstate.tuple);
+          apply_flow_to_consumers();
         }
       });
+
+      // A consumer created before the remote was known waits for it.
+      function apply_flow_to_consumers() {
+        tstate.consumers.forEach(function (c) {
+          try { c._applyFlow(); } catch (e) {}
+        });
+      }
 
       var send = function (buf) {
         var r = tstate.remote;
@@ -3318,6 +3329,7 @@ function Router(options) {
               tstate.remoteRtcp = { ip: opts2.ip, port: opts2.rtcpPort };
               tstate.rtcpTuple = tupleOf(rtcpSocket, tstate.remoteRtcp);
             }
+            apply_flow_to_consumers();
           }
           return Promise.resolve();
         },
