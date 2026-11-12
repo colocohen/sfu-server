@@ -961,6 +961,8 @@ function Consumer(opts) {
   };
 
   this.requestKeyFrame = function () {
+    if (state.closed) return Promise.resolve();
+    if (state.kind !== 'video') return Promise.resolve();   // mediasoup: video only
     // keyFrameRequestDelay (ProducerOptions): mediasoup refuses to ask
     // the producer again inside this window. Ours is honoured on the
     // Producer that owns the delay, so several consumers of one producer
@@ -974,8 +976,6 @@ function Consumer(opts) {
     var pr = state.transport._router._producerById(state.producerId);
     _diag('consumer ' + state.id.slice(0, 8) + ' requestKeyFrame: producer=' +
           (pr ? 'found' : 'MISSING') + ' handle=' + (pr && pr._sfuHandle() ? 'yes' : 'NO'));
-    if (state.closed) return Promise.resolve();
-    if (state.kind !== 'video') return Promise.resolve();   // mediasoup: video only
     var p = state.transport._router._producerById(state.producerId);
     if (p && p._sfuHandle()) { try { p._sfuHandle().requestKeyframe(); } catch (e) {} }
     return Promise.resolve();
