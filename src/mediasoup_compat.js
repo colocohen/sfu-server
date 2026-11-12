@@ -936,11 +936,12 @@ function Consumer(opts) {
     // flowing on a video consumer requests a fresh anchor — this is
     // exactly what mediasoup itself does on consumer.resume(). The flip
     // detection keeps it one request per transition, not per re-apply.
-    if (shouldFlow && !state.wasFlowing && state.kind === 'video') {
+    var startsFlowing = shouldFlow && !state.flowing;
+    state.flowing = shouldFlow;
+    if (startsFlowing && state.kind === 'video') {
       _diag('consumer ' + state.id.slice(0, 8) + ' FLOW-START → keyframe request (#23 path)');
       try { self.requestKeyFrame(); } catch (e) {}
     }
-    state.wasFlowing = shouldFlow;
   }
   this._applyFlow = apply_flow;   // transport re-applies once it can carry media
 
@@ -963,6 +964,7 @@ function Consumer(opts) {
   this.requestKeyFrame = function () {
     if (state.closed) return Promise.resolve();
     if (state.kind !== 'video') return Promise.resolve();   // mediasoup: video only
+    if (!state.flowing) return Promise.resolve();   // mediasoup: active consumers only
     // keyFrameRequestDelay (ProducerOptions): mediasoup refuses to ask
     // the producer again inside this window. Ours is honoured on the
     // Producer that owns the delay, so several consumers of one producer
