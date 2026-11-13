@@ -900,6 +900,15 @@ function Consumer(opts) {
     apply_flow();   // one rule, every entry point
   };
 
+  // Plain and pipe transports have no DTLS: their third input is the
+  // remote in their tuple, without which send() drops every packet.
+  function flows() {
+    var t = state.transport;
+    var canCarry = t.type === 'webrtc' ? t.dtlsState === 'connected'
+                                       : t.tuple.remotePort !== undefined;
+    return !!state.sfuHandle && !state.paused && !state.producerPaused && canCarry;
+  }
+
   function apply_flow() {
     if (!state.sfuHandle) return;
     // DTLS-GATED FLOW (found live, first full browser run of the compat
@@ -912,12 +921,7 @@ function Consumer(opts) {
     // attributed). Flow is therefore a CONDITION over three inputs —
     // paused, producerPaused, AND the transport's dtlsState — re-applied
     // whenever any of them changes, not an action taken at resume() time.
-    // Plain and pipe transports have no DTLS: their third input is the
-    // remote in their tuple, without which send() drops every packet.
-    var t = state.transport;
-    var canCarry = t.type === 'webrtc' ? t.dtlsState === 'connected'
-                                       : t.tuple.remotePort !== undefined;
-    var shouldFlow = !state.paused && !state.producerPaused && canCarry;
+    var shouldFlow = flows();
     try {
       if (shouldFlow) state.sfuHandle.resume();
       else            state.sfuHandle.pause();
@@ -936,12 +940,11 @@ function Consumer(opts) {
     // flowing on a video consumer requests a fresh anchor — this is
     // exactly what mediasoup itself does on consumer.resume(). The flip
     // detection keeps it one request per transition, not per re-apply.
-    var startsFlowing = shouldFlow && !state.flowing;
-    state.flowing = shouldFlow;
-    if (startsFlowing && state.kind === 'video') {
+    if (shouldFlow && !state.wasFlowing && state.kind === 'video') {
       _diag('consumer ' + state.id.slice(0, 8) + ' FLOW-START → keyframe request (#23 path)');
       try { self.requestKeyFrame(); } catch (e) {}
     }
+    state.wasFlowing = shouldFlow;
   }
   this._applyFlow = apply_flow;   // transport re-applies once it can carry media
 
@@ -964,7 +967,7 @@ function Consumer(opts) {
   this.requestKeyFrame = function () {
     if (state.closed) return Promise.resolve();
     if (state.kind !== 'video') return Promise.resolve();   // mediasoup: video only
-    if (!state.flowing) return Promise.resolve();   // mediasoup: active consumers only
+    if (!flows()) return Promise.resolve();   // mediasoup: active consumers only
     // keyFrameRequestDelay (ProducerOptions): mediasoup refuses to ask
     // the producer again inside this window. Ours is honoured on the
     // Producer that owns the delay, so several consumers of one producer
