@@ -339,6 +339,30 @@ function host_ipv4_addresses() {
   return out.length ? out : ['127.0.0.1'];
 }
 
+// mediasoup's PortManager: start at a random port of the range and take the
+// next one while a port is in use, so a firewall opened for the range holds.
+function bind_udp_in_range(range, cb) {
+  var size = range.max - range.min + 1;
+  var start = Math.floor(Math.random() * size);
+  (function attempt(n) {
+    if (n === size) {
+      return cb(new Error('no more available ports [protocol:udp, portRange:' +
+                          range.min + '-' + range.max + ']'));
+    }
+    var sock = dgram.createSocket('udp4');
+    var on_error = function (err) {
+      sock.close();
+      if (err.code === 'EADDRINUSE') attempt(n + 1);
+      else cb(err);
+    };
+    sock.once('error', on_error);
+    sock.bind({ address: '0.0.0.0', port: range.min + (start + n) % size }, function () {
+      sock.removeListener('error', on_error);
+      cb(null, sock);
+    });
+  })(0);
+}
+
 // A syntactically valid, never-verified fingerprint. Safe by the gate
 // invariant: inbound stays held until connect() installs the client's
 // REAL fingerprint, so no DTLS byte is ever checked against this.
@@ -1578,9 +1602,9 @@ function WebRtcTransport(opts, cb) {
     state.inboundGated = false;
     after_pc_ready(webRtcServer.announcedAddresses);
   } else {
-    var sock = dgram.createSocket('udp4');
-    state.ownSocket = sock;
-    sock.bind({ address: '0.0.0.0', port: opts.port || 0 }, function () {
+    bind_udp_in_range(opts.portRange, function (err, sock) {
+      if (err) return cb(err);
+      state.ownSocket = sock;
       state.port = sock.address().port;
 
       // INBOUND ROUTING — the piece the first cut missed (found live:
@@ -2761,7 +2785,7 @@ function WebRtcServer(options, cb) {
  *  Router
  * ═══════════════════════════════════════════════════════════════════ */
 
-function Router(options) {
+function Router(options, workerSettings) {
   var self = this;
   var ev = new EventEmitter();
   var observer = new EventEmitter();
@@ -2987,11 +3011,16 @@ function Router(options) {
   this.createWebRtcTransport = function (opts) {
     opts = opts || {};
     if (state.closed) return Promise.reject(InvalidStateError('Router closed'));
+    var portRange = port_range_of(opts);
+    if (portRange.max < portRange.min) {
+      return Promise.reject(new TypeError('createWebRtcTransport: maxPort cannot be less than minPort (' +
+                                          portRange.min + '-' + portRange.max + ')'));
+    }
     return new Promise(function (resolve, reject) {
       var t = new WebRtcTransport({
         router: self,
         webRtcServer: opts.webRtcServer || null,
-        port: opts.port,
+        portRange: portRange,
         announcedAddresses: announced_from(opts),
         enableSctp: opts.enableSctp,
         numSctpStreams: opts.numSctpStreams,
@@ -3016,6 +3045,17 @@ function Router(options) {
       void t;
     });
   };
+
+  // mediasoup's precedence: the first UDP listen info's portRange, else its
+  // port, else the transport's port (listenIps carry it beside them), else
+  // the Worker's rtcMinPort-rtcMaxPort (default 10000-59999).
+  function port_range_of(opts) {
+    var info = (opts.listenInfos || []).filter(function (i) { return !i.protocol || i.protocol === 'udp'; })[0] || {};
+    var port = info.port || opts.port;
+    if (info.portRange && info.portRange.min && info.portRange.max) return info.portRange;
+    if (port) return { min: port, max: port };
+    return { min: workerSettings.rtcMinPort || 10000, max: workerSettings.rtcMaxPort || 59999 };
+  }
 
   function announced_from(opts) {
     var out = [];
@@ -3681,7 +3721,7 @@ function Worker(settings) {
 
   this.createRouter = function (options) {
     if (state.closed) return Promise.reject(WorkerClosedError('Worker closed'));
-    var r = new Router(options || {});
+    var r = new Router(options || {}, state.settings);
     state.routers.push(r);
     observer.emit('newrouter', r);
     return Promise.resolve(r);
