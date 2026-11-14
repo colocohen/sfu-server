@@ -1,6 +1,6 @@
 {
   "name": "sfu-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Selective Forwarding Unit for Node.js. Multi-party WebRTC routing with no native bindings, no C++ toolchain, and a complete mediasoup v3 server API as a drop-in.",
   "type": "module",
   "main": "./index.js",

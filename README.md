@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="https://github.com/colocohen/sfu-server/raw/main/sfu-server.svg" width="450" alt="sfu-server"/>
-</p>
+
 
 <h1 align="center">SFU-SERVER</h1>
 <p align="center">
@@ -10,12 +8,6 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/sfu-server">
     <img src="https://img.shields.io/npm/v/sfu-server?color=blue" alt="npm">
-  </a>
-  <a href="https://github.com/colocohen/sfu-server">
-    <img src="https://img.shields.io/github/stars/colocohen/sfu-server?style=social" alt="github">
-  </a>
-  <a href="https://github.com/colocohen/sfu-server/issues">
-    <img src="https://img.shields.io/github/issues/colocohen/sfu-server?color=orange" alt="issues">
   </a>
   <img src="https://img.shields.io/github/license/colocohen/sfu-server?color=brightgreen" alt="license">
 </p>
