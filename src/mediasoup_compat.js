@@ -341,7 +341,10 @@ function host_ipv4_addresses() {
 
 // mediasoup's PortManager: start at a random port of the range and take the
 // next one while a port is in use, so a firewall opened for the range holds.
-function bind_udp_in_range(range, cb) {
+function bind_udp_in_range(method, range, ip, cb) {
+  if (range.max < range.min) {
+    return cb(new TypeError(method + ': maxPort cannot be less than minPort (' + range.min + '-' + range.max + ')'));
+  }
   var size = range.max - range.min + 1;
   var start = Math.floor(Math.random() * size);
   (function attempt(n) {
@@ -349,14 +352,14 @@ function bind_udp_in_range(range, cb) {
       return cb(new Error('no more available ports [protocol:udp, portRange:' +
                           range.min + '-' + range.max + ']'));
     }
-    var sock = dgram.createSocket('udp4');
+    var sock = dgram.createSocket(ip.indexOf(':') >= 0 ? 'udp6' : 'udp4');
     var on_error = function (err) {
       sock.close();
       if (err.code === 'EADDRINUSE') attempt(n + 1);
       else cb(err);
     };
     sock.once('error', on_error);
-    sock.bind({ address: '0.0.0.0', port: range.min + (start + n) % size }, function () {
+    sock.bind({ address: ip, port: range.min + (start + n) % size }, function () {
       sock.removeListener('error', on_error);
       cb(null, sock);
     });
@@ -1607,7 +1610,7 @@ function WebRtcTransport(opts, cb) {
     state.inboundGated = false;
     after_pc_ready(webRtcServer.announcedAddresses);
   } else {
-    bind_udp_in_range(opts.portRange, function (err, sock) {
+    bind_udp_in_range('createWebRtcTransport', opts.portRange, '0.0.0.0', function (err, sock) {
       if (err) return cb(err);
       state.ownSocket = sock;
       state.port = sock.address().port;
@@ -3016,16 +3019,12 @@ function Router(options, workerSettings) {
   this.createWebRtcTransport = function (opts) {
     opts = opts || {};
     if (state.closed) return Promise.reject(InvalidStateError('Router closed'));
-    var portRange = port_range_of(opts);
-    if (portRange.max < portRange.min) {
-      return Promise.reject(new TypeError('createWebRtcTransport: maxPort cannot be less than minPort (' +
-                                          portRange.min + '-' + portRange.max + ')'));
-    }
+    var udpInfo = (opts.listenInfos || []).filter(function (i) { return !i.protocol || i.protocol === 'udp'; })[0] || {};
     return new Promise(function (resolve, reject) {
       var t = new WebRtcTransport({
         router: self,
         webRtcServer: opts.webRtcServer || null,
-        portRange: portRange,
+        portRange: port_range_of(udpInfo, opts.port),
         announcedAddresses: announced_from(opts),
         enableSctp: opts.enableSctp,
         numSctpStreams: opts.numSctpStreams,
@@ -3051,12 +3050,11 @@ function Router(options, workerSettings) {
     });
   };
 
-  // mediasoup's precedence: the first UDP listen info's portRange, else its
-  // port, else the transport's port (listenIps carry it beside them), else
-  // the Worker's rtcMinPort-rtcMaxPort (default 10000-59999).
-  function port_range_of(opts) {
-    var info = (opts.listenInfos || []).filter(function (i) { return !i.protocol || i.protocol === 'udp'; })[0] || {};
-    var port = info.port || opts.port;
+  // mediasoup's precedence: the listen info's portRange, else its port, else
+  // the transport's port (listenIps carry it beside them), else the Worker's
+  // rtcMinPort-rtcMaxPort (default 10000-59999).
+  function port_range_of(info, port) {
+    port = info.port || port;
     if (info.portRange && info.portRange.min && info.portRange.max) return info.portRange;
     if (port) return { min: port, max: port };
     return { min: workerSettings.rtcMinPort || 10000, max: workerSettings.rtcMaxPort || 59999 };
@@ -3216,7 +3214,7 @@ function Router(options, workerSettings) {
     var ip = (typeof listen === 'string') ? listen : (listen.ip || '0.0.0.0');
     var announced = (typeof listen === 'object' &&
                      (listen.announcedAddress || listen.announcedIp)) || undefined;
-    var wantPort = (typeof listen === 'object' && listen.port) || 0;
+    var method = kindOfTransport === 'pipe' ? 'createPipeTransport' : 'createPlainTransport';
     var rtcpMux = options.rtcpMux !== false;      // mediasoup default: true
     var comedia = !!options.comedia;
 
@@ -3234,9 +3232,7 @@ function Router(options, workerSettings) {
       nextSsrc: (Math.random() * 0xfffffff) >>> 0,
     };
 
-    var socket = dgram.createSocket(ip.indexOf(':') >= 0 ? 'udp6' : 'udp4');
-    var rtcpSocket = rtcpMux ? null
-                             : dgram.createSocket(ip.indexOf(':') >= 0 ? 'udp6' : 'udp4');
+    var socket = null, rtcpSocket = null;
 
     function tupleOf(sock, remote) {
       var a = sock.address();
@@ -3265,13 +3261,10 @@ function Router(options, workerSettings) {
       };
       var done = function (t) { if (!settled) { settled = true; resolve(t); } };
 
-      socket.once('error', fail);
-      if (rtcpSocket) rtcpSocket.once('error', fail);
-
-      socket.bind(wantPort, ip === '0.0.0.0' || ip === '::' ? undefined : ip, function () {
+      bind_udp_in_range(method, port_range_of(listen, options.port), ip, function (err, sock) {
+        if (err) return fail(err);
+        socket = sock;
         var finish = function () {
-          socket.removeListener('error', fail);
-          if (rtcpSocket) rtcpSocket.removeListener('error', fail);
           tstate.tuple = tupleOf(socket, null);
           if (rtcpSocket) tstate.rtcpTuple = tupleOf(rtcpSocket, null);
           // The router can close while the socket is still binding — a
@@ -3290,8 +3283,15 @@ function Router(options, workerSettings) {
           catch (e) { return fail(e); }
           done(built);
         };
-        if (rtcpSocket) rtcpSocket.bind(0, undefined, finish);
-        else finish();
+        if (rtcpMux) return finish();
+        // RTCP binds by rtcpListenInfo, else by RTP's range and IP; a fixed RTP port is not reused.
+        var rtcp = options.rtcpListenInfo;
+        var rtcpRange = rtcp ? port_range_of(rtcp) : port_range_of({ portRange: listen.portRange });
+        bind_udp_in_range(method, rtcpRange, rtcp ? rtcp.ip || '0.0.0.0' : ip, function (err, sock) {
+          if (err) return fail(err);
+          rtcpSocket = sock;
+          finish();
+        });
       });
     });
 
