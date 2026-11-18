@@ -490,7 +490,7 @@ function synth_recv_answer(ourOfferSdp, clientDtls) {
  * rtpParameters.headerExtensions) — that is what it stamps on the wire,
  * and our parser learns ids from this SDP.
  */
-function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections) {
+function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections, reusable) {
   var enc   = (rp.encodings && rp.encodings[0]) || {};
   var cname = (rp.rtcp && rp.rtcp.cname) || 'mediasoup';
 
@@ -541,9 +541,13 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections) {
 
   // EVERY EARLIER m-SECTION IS RESTATED (found with a one-page client run):
   // left out, its receiver read no codecs and its consumers never bound.
-  var bundle = ['0'];
-  priorSections.forEach(function (sec) {
-    if (!/^m=\w+ 0 /.test(sec)) bundle.push(/a=mid:(\S+)/.exec(sec)[1]);
+  // A new one reuses a rejected slot the pc has answered (RFC 3264 8.1).
+  var slot = reusable.length ? reusable[0] : priorSections.length;
+  var bundle = ['0'], rejected = [];
+  priorSections.forEach(function (sec, i) {
+    if (i === slot) return;
+    if (/^m=\w+ 0 /.test(sec)) rejected.push(i);
+    else bundle.push(/a=mid:(\S+)/.exec(sec)[1]);
   });
   bundle.push(mediaMid);
 
@@ -580,7 +584,10 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections) {
     'a=setup:active',
   ]).concat(extLines).concat(codecLines).concat(ssrcLines).join('\r\n');
 
-  return { section: section, sdp: head.concat(priorSections, [section, '']).join('\r\n') };
+  var sections = priorSections.slice();
+  sections[slot] = section;
+  return { slot: slot, section: section, rejected: rejected,
+           sdp: head.concat(sections, ['']).join('\r\n') };
 }
 
 
@@ -1505,7 +1512,8 @@ function WebRtcTransport(opts, cb) {
     extRemapBySsrc:  {},       // ssrc → { internalExtId: clientExtId } (see wrapper)
     consumerBySsrc:  {},       // outgoing ssrc → Consumer (hot-path index)
     nextProduceMid:  1,        // internal mid namespace (0 = bootstrap DC)
-    produceSections: [],       // every m-section produce() offered, in order
+    produceSections: [],       // the produce offer's m-sections, in order
+    reusableSections: [],      // rejected ones an answered offer carried
     nextClientMid:   0,        // client-facing ordinal namespace
     sfuPeer:         null,     // sfu.js peer handle
     producers:       [],       // compat Producer objects
@@ -2187,19 +2195,21 @@ function WebRtcTransport(opts, cb) {
     // awaited interleaved their offers; one rejected, the other kept no codecs.
     return chained(function () {
       var mediaMid = String(state.nextProduceMid++);
-      var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, state.produceSections);
+      var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls,
+                                      state.produceSections, state.reusableSections);
       var pc = state.pc;
 
       return until_closed(pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
         .then(function () { return pc.createAnswer(); })
         .then(function (answer) { return pc.setLocalDescription(answer); }))
         .then(function () {
-          state.produceSections.push(offer.section);
+          state.produceSections[offer.slot] = offer.section;
+          state.reusableSections = offer.rejected;
           var producer = new Producer({
             id: options.id || uuid(), kind: kind, rtpParameters: rp,
             transport: self, paused: !!options.paused, appData: options.appData,
           });
-          producer._offerSection = state.produceSections.length - 1;
+          producer._offerSection = offer.slot;
           // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
           // every consumer's request passes through one throttle.
           producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
