@@ -490,7 +490,7 @@ function synth_recv_answer(ourOfferSdp, clientDtls) {
  * rtpParameters.headerExtensions) — that is what it stamps on the wire,
  * and our parser learns ids from this SDP.
  */
-function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
+function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections) {
   var enc   = (rp.encodings && rp.encodings[0]) || {};
   var cname = (rp.rtcp && rp.rtcp.cname) || 'mediasoup';
 
@@ -539,14 +539,20 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
     });
   }
 
-  var fpLines = fingerprint_lines(clientDtls);
-  var bundle = ['0'].concat(priorMids || []).concat([mediaMid]).join(' ');
+  // EVERY EARLIER m-SECTION IS RESTATED (found with a one-page client run):
+  // left out, its receiver read no codecs and its consumers never bound.
+  var bundle = ['0'];
+  priorSections.forEach(function (sec) {
+    if (!/^m=\w+ 0 /.test(sec)) bundle.push(/a=mid:(\S+)/.exec(sec)[1]);
+  });
+  bundle.push(mediaMid);
 
-  return [
+  var fpLines = fingerprint_lines(clientDtls);
+  var head = [
     'v=0',
     'o=- ' + Date.now() + ' 3 IN IP4 127.0.0.1',
     's=-', 't=0 0',
-    'a=group:BUNDLE ' + bundle,
+    'a=group:BUNDLE ' + bundle.join(' '),
     'a=msid-semantic: WMS',
     // m-line 1: the bootstrap application section, restated
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
@@ -557,18 +563,24 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
   ].concat(fpLines).concat([
     'a=setup:active',
     'a=sctp-port:5000',
-    // m-line 2: the client's media, sendonly toward us
+  ]);
+  var section = [
+    // the new m-line: the client's media, sendonly toward us
     'm=' + kind + ' 9 UDP/TLS/RTP/SAVPF ' + pts.join(' '),
     'c=IN IP4 0.0.0.0',
     'a=mid:' + mediaMid,
     'a=sendonly',
+    // a=msid keeps a restated section quiet: without it webrtc-server
+    // re-fires 'track' for it and the engine adds a duplicate producer
+    'a=msid:' + (rp.msid || cname + ' ' + mediaMid),
     'a=rtcp-mux',
     'a=ice-ufrag:msclient',
     'a=ice-pwd:msclientmsclientmsclient',
-  ]).concat(fpLines).concat([
+  ].concat(fpLines).concat([
     'a=setup:active',
-  ]).concat(extLines).concat(codecLines).concat(ssrcLines)
-   .concat(['']).join('\r\n');
+  ]).concat(extLines).concat(codecLines).concat(ssrcLines).join('\r\n');
+
+  return { section: section, sdp: head.concat(priorSections, [section, '']).join('\r\n') };
 }
 
 
@@ -1493,7 +1505,7 @@ function WebRtcTransport(opts, cb) {
     extRemapBySsrc:  {},       // ssrc → { internalExtId: clientExtId } (see wrapper)
     consumerBySsrc:  {},       // outgoing ssrc → Consumer (hot-path index)
     nextProduceMid:  1,        // internal mid namespace (0 = bootstrap DC)
-    produceMids:     [],
+    produceSections: [],       // every m-section produce() offered, in order
     nextClientMid:   0,        // client-facing ordinal namespace
     sfuPeer:         null,     // sfu.js peer handle
     producers:       [],       // compat Producer objects
@@ -2160,20 +2172,19 @@ function WebRtcTransport(opts, cb) {
     }
 
     var mediaMid = String(state.nextProduceMid++);
-    var priorMids = state.produceMids.slice();
-    state.produceMids.push(mediaMid);
-
-    var offerSdp = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, priorMids);
+    var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, state.produceSections);
     var pc = state.pc;
 
-    return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offerSdp }))
+    return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
       .then(function () { return pc.createAnswer(); })
       .then(function (answer) { return pc.setLocalDescription(answer); })
       .then(function () {
+        state.produceSections.push(offer.section);
         var producer = new Producer({
           id: options.id || uuid(), kind: kind, rtpParameters: rp,
           transport: self, paused: !!options.paused, appData: options.appData,
         });
+        producer._offerSection = state.produceSections.length - 1;
         // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
         // every consumer's request passes through one throttle.
         producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
@@ -2620,6 +2631,9 @@ function WebRtcTransport(opts, cb) {
   this._onProducerClosed = function (producer) {
     var i = state.producers.indexOf(producer);
     if (i >= 0) state.producers.splice(i, 1);
+    // its m-line stays in later produce offers, rejected (RFC 3264 8.2)
+    var s = producer._offerSection;
+    state.produceSections[s] = state.produceSections[s].replace(/^(m=\w+) 9 /, '$1 0 ');
     router._unregisterProducer(producer);
   };
   this._onConsumerClosed = function (consumer) {
