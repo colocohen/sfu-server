@@ -1522,6 +1522,7 @@ function WebRtcTransport(opts, cb) {
     dataProducers:   [],
     dataConsumers:   [],
     negotiationChain: Promise.resolve(),   // serializes all SDP work on this pc (see chained)
+    abortNegotiation: null,                // rejects the running step (see chained)
     nextDataStreamId: 100,     // negotiated-id space for OUR consumers; starts
                                // above the DCEP-assigned ids (bootstrap channel)
                                // so the two allocation worlds can't collide
@@ -2051,10 +2052,14 @@ function WebRtcTransport(opts, cb) {
   // through one promise chain: same behavior for polite sequential
   // callers, correctness for concurrent ones.
   function chained(fn) {
-    // a step still queued when the transport closes (found by review) left its
-    // promise pending on the closed pc; it rejects here instead of starting
+    // a step settles when the transport closes: still queued, it never starts;
+    // running, close() rejects it, as a closed pc can leave its SDP pending
     var step = function () {
-      return state.closed ? Promise.reject(InvalidStateError('transport closed')) : fn();
+      if (state.closed) return Promise.reject(InvalidStateError('transport closed'));
+      return new Promise(function (resolve, reject) {
+        state.abortNegotiation = function () { reject(InvalidStateError('transport closed')); };
+        fn().then(resolve, reject);
+      });
     };
     var run = state.negotiationChain.then(step, step);
     state.negotiationChain = run.then(function () {}, function () {});
@@ -2699,6 +2704,7 @@ function WebRtcTransport(opts, cb) {
     } catch (e) {}
     if (state.sfuPeer) { try { state.sfuPeer.close(); } catch (e) {} }
     try { state.pc && state.pc.close(); } catch (e) {}
+    if (state.abortNegotiation) state.abortNegotiation();
     if (state.ownWebrtcRouter) { try { state.ownWebrtcRouter.close(); } catch (e) {} }
     if (state.ownSocket) { try { state.ownSocket.close(); } catch (e) {} }
     state.iceState = 'closed'; state.dtlsState = 'closed';
