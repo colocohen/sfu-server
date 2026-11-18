@@ -490,7 +490,7 @@ function synth_recv_answer(ourOfferSdp, clientDtls) {
  * rtpParameters.headerExtensions) — that is what it stamps on the wire,
  * and our parser learns ids from this SDP.
  */
-function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
+function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections, reusable) {
   var enc   = (rp.encodings && rp.encodings[0]) || {};
   var cname = (rp.rtcp && rp.rtcp.cname) || 'mediasoup';
 
@@ -539,14 +539,24 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
     });
   }
 
-  var fpLines = fingerprint_lines(clientDtls);
-  var bundle = ['0'].concat(priorMids || []).concat([mediaMid]).join(' ');
+  // EVERY EARLIER m-SECTION IS RESTATED (found with a one-page client run):
+  // left out, its receiver read no codecs and its consumers never bound.
+  // A new one reuses a rejected slot the pc has answered (RFC 3264 8.1).
+  var slot = reusable.length ? reusable[0] : priorSections.length;
+  var bundle = ['0'], rejected = [];
+  priorSections.forEach(function (sec, i) {
+    if (i === slot) return;
+    if (/^m=\w+ 0 /.test(sec)) rejected.push(i);
+    else bundle.push(/a=mid:(\S+)/.exec(sec)[1]);
+  });
+  bundle.push(mediaMid);
 
-  return [
+  var fpLines = fingerprint_lines(clientDtls);
+  var head = [
     'v=0',
     'o=- ' + Date.now() + ' 3 IN IP4 127.0.0.1',
     's=-', 't=0 0',
-    'a=group:BUNDLE ' + bundle,
+    'a=group:BUNDLE ' + bundle.join(' '),
     'a=msid-semantic: WMS',
     // m-line 1: the bootstrap application section, restated
     'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
@@ -557,18 +567,28 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorMids) {
   ].concat(fpLines).concat([
     'a=setup:active',
     'a=sctp-port:5000',
-    // m-line 2: the client's media, sendonly toward us
+  ]);
+  var section = [
+    // the new m-line: the client's media, sendonly toward us
     'm=' + kind + ' 9 UDP/TLS/RTP/SAVPF ' + pts.join(' '),
     'c=IN IP4 0.0.0.0',
     'a=mid:' + mediaMid,
     'a=sendonly',
+    // a=msid keeps a restated section quiet (without it webrtc-server re-fires
+    // 'track'): our mid as track, and '-' for no stream, as a named one keeps
+    // every closed track
+    'a=msid:- ' + mediaMid,
     'a=rtcp-mux',
     'a=ice-ufrag:msclient',
     'a=ice-pwd:msclientmsclientmsclient',
-  ]).concat(fpLines).concat([
+  ].concat(fpLines).concat([
     'a=setup:active',
-  ]).concat(extLines).concat(codecLines).concat(ssrcLines)
-   .concat(['']).join('\r\n');
+  ]).concat(extLines).concat(codecLines).concat(ssrcLines).join('\r\n');
+
+  var sections = priorSections.slice();
+  sections[slot] = section;
+  return { slot: slot, section: section, rejected: rejected,
+           sdp: head.concat(sections, ['']).join('\r\n') };
 }
 
 
@@ -1493,7 +1513,8 @@ function WebRtcTransport(opts, cb) {
     extRemapBySsrc:  {},       // ssrc → { internalExtId: clientExtId } (see wrapper)
     consumerBySsrc:  {},       // outgoing ssrc → Consumer (hot-path index)
     nextProduceMid:  1,        // internal mid namespace (0 = bootstrap DC)
-    produceMids:     [],
+    produceSections: [],       // the produce offer's m-sections, in order
+    reusableSections: [],      // rejected ones an answered offer carried
     nextClientMid:   0,        // client-facing ordinal namespace
     sfuPeer:         null,     // sfu.js peer handle
     producers:       [],       // compat Producer objects
@@ -1510,6 +1531,7 @@ function WebRtcTransport(opts, cb) {
     dataProducers:   [],
     dataConsumers:   [],
     negotiationChain: Promise.resolve(),   // serializes all SDP work on this pc (see chained)
+    abortNegotiation: null,                // rejects a wait on the pc (see until_closed)
     nextDataStreamId: 100,     // negotiated-id space for OUR consumers; starts
                                // above the DCEP-assigned ids (bootstrap channel)
                                // so the two allocation worlds can't collide
@@ -2039,9 +2061,20 @@ function WebRtcTransport(opts, cb) {
   // through one promise chain: same behavior for polite sequential
   // callers, correctness for concurrent ones.
   function chained(fn) {
-    var run = state.negotiationChain.then(fn, fn);
+    // a step queued behind a close never starts
+    var step = function () {
+      return state.closed ? Promise.reject(InvalidStateError('transport closed')) : fn();
+    };
+    var run = state.negotiationChain.then(step, step);
     state.negotiationChain = run.then(function () {}, function () {});
     return run;
+  }
+  // a closed pc can leave its SDP pending, so close() rejects the wait on it
+  function until_closed(sdpWork) {
+    return new Promise(function (resolve, reject) {
+      state.abortNegotiation = function () { reject(InvalidStateError('transport closed')); };
+      sdpWork.then(resolve, reject);
+    });
   }
   // Public form: every external caller is serialized automatically.
   // renegotiateRaw is for code ALREADY running inside chained() — calling
@@ -2064,12 +2097,12 @@ function WebRtcTransport(opts, cb) {
     // fingerprint is installed), and connect() re-renegotiates with the
     // real one the moment it arrives.
     var dtls = state.clientDtls || PLACEHOLDER_DTLS;
-    return pc.createOffer()
+    return until_closed(pc.createOffer()
       .then(function (offer) { return pc.setLocalDescription(offer); })
       .then(function () {
         var answer = synth_recv_answer(pc.localDescription.sdp, dtls);
         return pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer }));
-      });
+      }));
   }
   this._renegotiate = renegotiate;
 
@@ -2159,39 +2192,44 @@ function WebRtcTransport(opts, cb) {
       }) });
     }
 
-    var mediaMid = String(state.nextProduceMid++);
-    var priorMids = state.produceMids.slice();
-    state.produceMids.push(mediaMid);
+    // ONE NEGOTIATION AT A TIME (found by review): two produce() calls not
+    // awaited interleaved their offers; one rejected, the other kept no codecs.
+    return chained(function () {
+      var mediaMid = String(state.nextProduceMid++);
+      var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls,
+                                      state.produceSections, state.reusableSections);
+      var pc = state.pc;
 
-    var offerSdp = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, priorMids);
-    var pc = state.pc;
+      return until_closed(pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
+        .then(function () { return pc.createAnswer(); })
+        .then(function (answer) { return pc.setLocalDescription(answer); }))
+        .then(function () {
+          state.produceSections[offer.slot] = offer.section;
+          state.reusableSections = offer.rejected;
+          var producer = new Producer({
+            id: options.id || uuid(), kind: kind, rtpParameters: rp,
+            transport: self, paused: !!options.paused, appData: options.appData,
+          });
+          producer._offerSection = offer.slot;
+          // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
+          // every consumer's request passes through one throttle.
+          producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
+          state.producers.push(producer);
+          router._registerProducer(producer);
 
-    return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offerSdp }))
-      .then(function () { return pc.createAnswer(); })
-      .then(function (answer) { return pc.setLocalDescription(answer); })
-      .then(function () {
-        var producer = new Producer({
-          id: options.id || uuid(), kind: kind, rtpParameters: rp,
-          transport: self, paused: !!options.paused, appData: options.appData,
+          // The engine creates its own producer record from the pc's
+          // 'track' event. Claim it when it appears — the correlation is
+          // by (our peer, kind, not-yet-claimed), which is unambiguous
+          // because produce() is serialized per transport.
+          router._claimSfuProducer(state.sfuPeer, kind, function (sfuHandle) {
+            producer._setSfuHandle(sfuHandle);
+            _diag('producer ' + producer.id + ' ↔ engine ' + sfuHandle.id);
+          });
+
+          observer.emit('newproducer', producer);
+          return producer;
         });
-        // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
-        // every consumer's request passes through one throttle.
-        producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
-        state.producers.push(producer);
-        router._registerProducer(producer);
-
-        // The engine creates its own producer record from the pc's
-        // 'track' event. Claim it when it appears — the correlation is
-        // by (our peer, kind, not-yet-claimed), which is unambiguous
-        // because produce() is serialized per transport.
-        router._claimSfuProducer(state.sfuPeer, kind, function (sfuHandle) {
-          producer._setSfuHandle(sfuHandle);
-          _diag('producer ' + producer.id + ' ↔ engine ' + sfuHandle.id);
-        });
-
-        observer.emit('newproducer', producer);
-        return producer;
-      });
+    });
   };
 
   /* ── consume ─────────────────────────────────────────────────────
@@ -2620,6 +2658,9 @@ function WebRtcTransport(opts, cb) {
   this._onProducerClosed = function (producer) {
     var i = state.producers.indexOf(producer);
     if (i >= 0) state.producers.splice(i, 1);
+    // its m-line stays in later produce offers, rejected (RFC 3264 8.2)
+    var s = producer._offerSection;
+    state.produceSections[s] = state.produceSections[s].replace(/^(m=\w+) 9 /, '$1 0 ');
     router._unregisterProducer(producer);
   };
   this._onConsumerClosed = function (consumer) {
@@ -2676,6 +2717,7 @@ function WebRtcTransport(opts, cb) {
     } catch (e) {}
     if (state.sfuPeer) { try { state.sfuPeer.close(); } catch (e) {} }
     try { state.pc && state.pc.close(); } catch (e) {}
+    if (state.abortNegotiation) state.abortNegotiation();
     if (state.ownWebrtcRouter) { try { state.ownWebrtcRouter.close(); } catch (e) {} }
     if (state.ownSocket) { try { state.ownSocket.close(); } catch (e) {} }
     state.iceState = 'closed'; state.dtlsState = 'closed';
