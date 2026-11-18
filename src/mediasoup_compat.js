@@ -1522,7 +1522,7 @@ function WebRtcTransport(opts, cb) {
     dataProducers:   [],
     dataConsumers:   [],
     negotiationChain: Promise.resolve(),   // serializes all SDP work on this pc (see chained)
-    abortNegotiation: null,                // rejects a step waiting on the pc (see chained)
+    abortNegotiation: null,                // rejects a wait on the pc (see until_closed)
     nextDataStreamId: 100,     // negotiated-id space for OUR consumers; starts
                                // above the DCEP-assigned ids (bootstrap channel)
                                // so the two allocation worlds can't collide
@@ -2052,19 +2052,20 @@ function WebRtcTransport(opts, cb) {
   // through one promise chain: same behavior for polite sequential
   // callers, correctness for concurrent ones.
   function chained(fn) {
-    // a step settles when the transport closes: still queued, it never starts;
-    // waiting on the pc, close() rejects it, as a closed pc can leave its SDP
-    // pending; once the pc has answered, the step clears abortNegotiation
+    // a step queued behind a close never starts
     var step = function () {
-      if (state.closed) return Promise.reject(InvalidStateError('transport closed'));
-      return new Promise(function (resolve, reject) {
-        state.abortNegotiation = function () { reject(InvalidStateError('transport closed')); };
-        fn().then(resolve, reject);
-      });
+      return state.closed ? Promise.reject(InvalidStateError('transport closed')) : fn();
     };
     var run = state.negotiationChain.then(step, step);
     state.negotiationChain = run.then(function () {}, function () {});
     return run;
+  }
+  // a closed pc can leave its SDP pending, so close() rejects the wait on it
+  function until_closed(sdpWork) {
+    return new Promise(function (resolve, reject) {
+      state.abortNegotiation = function () { reject(InvalidStateError('transport closed')); };
+      sdpWork.then(resolve, reject);
+    });
   }
   // Public form: every external caller is serialized automatically.
   // renegotiateRaw is for code ALREADY running inside chained() — calling
@@ -2087,12 +2088,12 @@ function WebRtcTransport(opts, cb) {
     // fingerprint is installed), and connect() re-renegotiates with the
     // real one the moment it arrives.
     var dtls = state.clientDtls || PLACEHOLDER_DTLS;
-    return pc.createOffer()
+    return until_closed(pc.createOffer()
       .then(function (offer) { return pc.setLocalDescription(offer); })
       .then(function () {
         var answer = synth_recv_answer(pc.localDescription.sdp, dtls);
         return pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer }));
-      });
+      }));
   }
   this._renegotiate = renegotiate;
 
@@ -2189,12 +2190,10 @@ function WebRtcTransport(opts, cb) {
       var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, state.produceSections);
       var pc = state.pc;
 
-      return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
+      return until_closed(pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
         .then(function () { return pc.createAnswer(); })
-        .then(function (answer) { return pc.setLocalDescription(answer); })
+        .then(function (answer) { return pc.setLocalDescription(answer); }))
         .then(function () {
-          // answered: a close from here on closes the Producer this returns
-          state.abortNegotiation = null;
           state.produceSections.push(offer.section);
           var producer = new Producer({
             id: options.id || uuid(), kind: kind, rtpParameters: rp,
@@ -2283,8 +2282,6 @@ function WebRtcTransport(opts, cb) {
       });
 
       return renegotiateRaw().then(function () {
-      // answered: a close from here on closes the Consumer this returns
-      state.abortNegotiation = null;
       var t = new_transceiver_since(before);
       if (!t) throw new Error('consume: engine added no transceiver');
 
