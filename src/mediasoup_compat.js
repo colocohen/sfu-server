@@ -1522,7 +1522,7 @@ function WebRtcTransport(opts, cb) {
     dataProducers:   [],
     dataConsumers:   [],
     negotiationChain: Promise.resolve(),   // serializes all SDP work on this pc (see chained)
-    abortNegotiation: null,                // rejects the running step (see chained)
+    abortNegotiation: null,                // rejects a step waiting on the pc (see chained)
     nextDataStreamId: 100,     // negotiated-id space for OUR consumers; starts
                                // above the DCEP-assigned ids (bootstrap channel)
                                // so the two allocation worlds can't collide
@@ -2053,7 +2053,8 @@ function WebRtcTransport(opts, cb) {
   // callers, correctness for concurrent ones.
   function chained(fn) {
     // a step settles when the transport closes: still queued, it never starts;
-    // running, close() rejects it, as a closed pc can leave its SDP pending
+    // waiting on the pc, close() rejects it, as a closed pc can leave its SDP
+    // pending; once the pc has answered, the step clears abortNegotiation
     var step = function () {
       if (state.closed) return Promise.reject(InvalidStateError('transport closed'));
       return new Promise(function (resolve, reject) {
@@ -2192,6 +2193,8 @@ function WebRtcTransport(opts, cb) {
         .then(function () { return pc.createAnswer(); })
         .then(function (answer) { return pc.setLocalDescription(answer); })
         .then(function () {
+          // answered: a close from here on closes the Producer this returns
+          state.abortNegotiation = null;
           state.produceSections.push(offer.section);
           var producer = new Producer({
             id: options.id || uuid(), kind: kind, rtpParameters: rp,
@@ -2280,6 +2283,8 @@ function WebRtcTransport(opts, cb) {
       });
 
       return renegotiateRaw().then(function () {
+      // answered: a close from here on closes the Consumer this returns
+      state.abortNegotiation = null;
       var t = new_transceiver_since(before);
       if (!t) throw new Error('consume: engine added no transceiver');
 
