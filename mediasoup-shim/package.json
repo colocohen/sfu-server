@@ -1,0 +1,57 @@
+{
+  "name": "sfu-server-mediasoup",
+  "version": "0.1.0",
+  "description": "Drop-in replacement for the mediasoup v3 server API, served by sfu-server: pure JavaScript, no worker binary, no C++ toolchain. Install as mediasoup@npm:sfu-server-mediasoup.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
+    "./types": {
+      "types": "./types.d.ts",
+      "import": "./types.js",
+      "default": "./types.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "types.js",
+    "types.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "sfu-server": "^0.2.0"
+  },
+  "keywords": [
+    "mediasoup",
+    "mediasoup-compat",
+    "mediasoup-alternative",
+    "drop-in",
+    "sfu",
+    "webrtc",
+    "pure-javascript",
+    "no-native"
+  ],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/sfu-server.git",
+    "directory": "mediasoup-shim"
+  },
+  "homepage": "https://github.com/colocohen/sfu-server/tree/main/mediasoup-shim#readme",
+  "bugs": {
+    "url": "https://github.com/colocohen/sfu-server/issues"
+  }
+}
