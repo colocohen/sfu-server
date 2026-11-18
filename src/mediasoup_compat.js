@@ -2171,38 +2171,42 @@ function WebRtcTransport(opts, cb) {
       }) });
     }
 
-    var mediaMid = String(state.nextProduceMid++);
-    var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, state.produceSections);
-    var pc = state.pc;
+    // ONE NEGOTIATION AT A TIME (found by review): two produce() calls not
+    // awaited interleaved their offers; one rejected, the other kept no codecs.
+    return chained(function () {
+      var mediaMid = String(state.nextProduceMid++);
+      var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls, state.produceSections);
+      var pc = state.pc;
 
-    return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
-      .then(function () { return pc.createAnswer(); })
-      .then(function (answer) { return pc.setLocalDescription(answer); })
-      .then(function () {
-        state.produceSections.push(offer.section);
-        var producer = new Producer({
-          id: options.id || uuid(), kind: kind, rtpParameters: rp,
-          transport: self, paused: !!options.paused, appData: options.appData,
+      return pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer.sdp }))
+        .then(function () { return pc.createAnswer(); })
+        .then(function (answer) { return pc.setLocalDescription(answer); })
+        .then(function () {
+          state.produceSections.push(offer.section);
+          var producer = new Producer({
+            id: options.id || uuid(), kind: kind, rtpParameters: rp,
+            transport: self, paused: !!options.paused, appData: options.appData,
+          });
+          producer._offerSection = state.produceSections.length - 1;
+          // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
+          // every consumer's request passes through one throttle.
+          producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
+          state.producers.push(producer);
+          router._registerProducer(producer);
+
+          // The engine creates its own producer record from the pc's
+          // 'track' event. Claim it when it appears — the correlation is
+          // by (our peer, kind, not-yet-claimed), which is unambiguous
+          // because produce() is serialized per transport.
+          router._claimSfuProducer(state.sfuPeer, kind, function (sfuHandle) {
+            producer._setSfuHandle(sfuHandle);
+            _diag('producer ' + producer.id + ' ↔ engine ' + sfuHandle.id);
+          });
+
+          observer.emit('newproducer', producer);
+          return producer;
         });
-        producer._offerSection = state.produceSections.length - 1;
-        // ProducerOptions.keyFrameRequestDelay — the producer owns it, so
-        // every consumer's request passes through one throttle.
-        producer._kfDelay = Number(options.keyFrameRequestDelay) || 0;
-        state.producers.push(producer);
-        router._registerProducer(producer);
-
-        // The engine creates its own producer record from the pc's
-        // 'track' event. Claim it when it appears — the correlation is
-        // by (our peer, kind, not-yet-claimed), which is unambiguous
-        // because produce() is serialized per transport.
-        router._claimSfuProducer(state.sfuPeer, kind, function (sfuHandle) {
-          producer._setSfuHandle(sfuHandle);
-          _diag('producer ' + producer.id + ' ↔ engine ' + sfuHandle.id);
-        });
-
-        observer.emit('newproducer', producer);
-        return producer;
-      });
+    });
   };
 
   /* ── consume ─────────────────────────────────────────────────────
