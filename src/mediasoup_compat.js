@@ -571,8 +571,8 @@ function synth_produce_offer(kind, rp, mediaMid, clientDtls, priorSections) {
     'a=mid:' + mediaMid,
     'a=sendonly',
     // a=msid keeps a restated section quiet (without it webrtc-server re-fires
-    // 'track'); the track token is our mid, as a client's msid may repeat
-    'a=msid:' + cname + ' ' + mediaMid,
+    // 'track'): the client's stream, with our mid as track, as msids may repeat
+    'a=msid:' + ((rp.msid || '').split(' ')[0] || cname) + ' ' + mediaMid,
     'a=rtcp-mux',
     'a=ice-ufrag:msclient',
     'a=ice-pwd:msclientmsclientmsclient',
