@@ -2051,7 +2051,12 @@ function WebRtcTransport(opts, cb) {
   // through one promise chain: same behavior for polite sequential
   // callers, correctness for concurrent ones.
   function chained(fn) {
-    var run = state.negotiationChain.then(fn, fn);
+    // a step still queued when the transport closes (found by review) left its
+    // promise pending on the closed pc; it rejects here instead of starting
+    var step = function () {
+      return state.closed ? Promise.reject(InvalidStateError('transport closed')) : fn();
+    };
+    var run = state.negotiationChain.then(step, step);
     state.negotiationChain = run.then(function () {}, function () {});
     return run;
   }
