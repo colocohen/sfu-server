@@ -47,11 +47,10 @@ var _ids = { peer: 0, producer: 0, consumer: 0 };
 var _DIAG = !!(typeof process !== 'undefined' && process.env &&
                (process.env.SFU_DEBUG || process.env.WEBRTC_DEBUG));
 // Ingress keyframe tracing (#26 diagnosis). Module scope, next to _diag,
-// so it is visible everywhere _diag is — the previous attempt declared it
-// inside a nested scope the tap could not see, and node --check plus the
-// whole suite stayed green because no test drives a live RTP tap. Flip to
-// false when the keyframe question is settled.
-var _DBG_KF = true;
+// so it is visible everywhere _diag is. It was hard-wired to true, which
+// made the tap parse EVERY forwarded packet for a log line that only
+// prints under SFU_DEBUG anyway; it now follows the diagnostics switch.
+var _DBG_KF = _DIAG;
 // Anchor-debt retry cadence (#26). Chosen at 1000ms against VP8 and then
 // measured against H.264, where the first keyframe is several times
 // larger and lands later: a full second between "the anchor was
@@ -67,18 +66,47 @@ var KF_RETRY_MS = 300;
 // has certainly sent one by now, we simply could not see it.
 var KF_MAX_RETRIES = 10;
 
+// A peer whose connection reports 'disconnected' may come back (ICE
+// consent recovers, a Wi-Fi blip ends); 'failed' and 'closed' are final.
+// Tearing a peer down on the first 'disconnected' would kill calls that
+// were about to recover, and never tearing it down left a dead peer in
+// the room forever — so it gets this long to return to 'connected'.
+var DISCONNECT_GRACE_MS = 15000;
+
+// The RTP clock of what we forward. Used to advance the outgoing
+// timestamp across a gap (pause, layer switch) by the time that passed.
+function clock_rate_of(kind) { return kind === 'video' ? 90000 : 48000; }
+
+// Wrap-safe signed 16-bit sequence delta (a - b).
+function seq_delta(a, b) {
+  var d = (a - b) & 0xFFFF;
+  return d >= 0x8000 ? d - 0x10000 : d;
+}
+
+var RID_EXT_URI = 'urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id';
+// The rid header extension is only carried until the sender sees our
+// receiver reports; a stream that has not shown one by then never will
+// (audio, single-layer video), so we stop looking.
+var RID_LEARN_MAX_PKTS = 300;
+// How far behind the newest primary packet a hole is remembered, waiting
+// for its retransmission (see the RTX handling in the tap).
+var GAP_MEMORY = 512;
+
 /* ── M3a: simulcast layer selection ──────────────────────────────
  * A simulcast producer is not one stream but several live at once
  * (r0/r1/r2). Which one a consumer forwards is a CONDITION over the
  * layers' current liveness — never a latched decision — so it lives in
  * the cascades like everything else.
  *
- * Ranking without rid: the tap counts bytes per ssrc, and a higher
- * spatial layer is unavoidably the fatter stream. That is codec- and
- * SDP-agnostic, needs no new engine↔transport coupling, and degrades
- * sanely if a layer is added or dropped mid-call. (When webrtc-server
- * grows a public rid accessor this becomes a label lookup instead of an
- * inference — the selection logic does not change.)
+ * Ranking: by the producer's SDP. The sender lists its rids in
+ * a=simulcast:send low→high (the order of its sendEncodings, the same
+ * convention mediasoup relies on), and the tap learns each ssrc's rid
+ * from the rtp-stream-id header extension. Ranking used to be inferred
+ * from byte rate ("the higher layer is the fatter stream"), and that
+ * inference broke on real Chrome: its bandwidth probes are RTX copies of
+ * the LOW layer, which made r0 the fattest stream and "best" the worst.
+ * Byte rate (primary packets only) remains the fallback for a producer
+ * whose layers carry no rid.
  */
 var LAYER_STALE_MS   = 400;    // no packet for this long ⇒ layer is not carrying
 var LAYER_UP_HOLD_MS = 2000;   // a better layer must stay fresh this long before we climb
@@ -253,6 +281,24 @@ function Router(options) {
   }
 
   function run_cascades_once() {
+    // P. PRODUCER LIVENESS. A peer that stops sending the standard way
+    // (removeTrack / direction change / transceiver.stop + renegotiation)
+    // leaves our receiver track MUTED, not ended — that is W3C, and it
+    // is what webrtc-server does. Listening only for 'ended' therefore
+    // kept the producer and every consumer of it alive, and viewers sat
+    // on a frozen frame forever. The negotiated direction is the fact:
+    // once it no longer includes receiving, the producer is over. (A
+    // later re-add arrives as a new 'track' event, i.e. a new producer —
+    // the same thing mediasoup does on the client's closeProducer.)
+    for (var pi = state.producers.length - 1; pi >= 0; pi--) {
+      var pp = state.producers[pi];
+      if (pp && !pp.closed && !pp.plain && producer_stopped_receiving(pp)) {
+        _diag(pp.id + ' cascadeP: transceiver no longer receives (' +
+              (pp.transceiver.currentDirection || pp.transceiver.direction) + ') — closing producer');
+        close_producer(pp);
+      }
+    }
+
     for (var i = state.consumers.length - 1; i >= 0; i--) {
       var c = state.consumers[i];
       if (!c || c.closed) continue;
@@ -373,9 +419,13 @@ function Router(options) {
         var lys = producer_layers(p);
         if (lys.length > 1 || (lys.length === 1 && lys[0].ssrc !== c.src_ssrc)) {
           var want = choose_layer(c, lys, consumer_budget_bps(c));
-          if (want && want.ssrc !== c.src_ssrc) {
+          if (want && want.ssrc === c.src_ssrc && c.target_ssrc != null) {
+            // Changed our mind before the target's keyframe came: stay.
+            _diag(c.id + ' cascade3c: pending switch to ' + c.target_ssrc + ' cancelled');
+            set_switch_target(c, null);
+          } else if (want && want.ssrc !== c.src_ssrc && want.ssrc !== c.target_ssrc) {
             _diag(c.id + ' cascade3c: layer switch ' + c.src_ssrc + ' → ' + want.ssrc +
-                  ' (' + lys.length + ' layers, rate=' + Math.round(want.rate) + 'B/s)');
+                  ' requested (' + lys.length + ' layers) — waiting for its keyframe');
             switch_consumer_layer(c, want.ssrc);
           }
         }
@@ -493,8 +543,46 @@ function Router(options) {
     return '';
   }
 
+  // The producer's rids in the order its SDP lists them (low→high), or
+  // null when it is not rid-simulcast. Cached per remote description; a
+  // renegotiation whose answer happens to omit the simulcast lines keeps
+  // the order already learned — the layers on the wire did not change.
+  function producer_rid_order(p) {
+    var desc = p.peer.pc && p.peer.pc.remoteDescription;
+    var sdp = desc && desc.sdp;
+    if (!sdp || p._ridSdp === sdp) return p._ridOrder || null;
+    p._ridSdp = sdp;
+    var mid = p.transceiver && p.transceiver.mid;
+    if (mid == null) return p._ridOrder || null;
+    var sections = sdp.split(/\r?\nm=/);
+    for (var i = 1; i < sections.length; i++) {
+      var sec = sections[i];
+      var mm = sec.match(/\r?\na=mid:(\S+)/);
+      if (!mm || mm[1] !== String(mid)) continue;
+      var order = [];
+      // a=simulcast:send q;h;f — ';' separates layers, ',' alternatives
+      // of one layer, '~' marks a layer that starts paused.
+      var sim = sec.match(/\r?\na=simulcast:send ([^\s]+)/);
+      if (sim) {
+        var groups = sim[1].split(';');
+        for (var g = 0; g < groups.length; g++) {
+          var alts = groups[g].split(',');
+          for (var a = 0; a < alts.length; a++) order.push(alts[a].replace(/^~/, ''));
+        }
+      } else {
+        var re = /\r?\na=rid:(\S+) send/g, r;
+        while ((r = re.exec(sec))) order.push(r[1]);
+      }
+      if (order.length > 1) p._ridOrder = order;
+      break;
+    }
+    return p._ridOrder || null;
+  }
+
   // The producer's live layers, scoped to ITS receiver (so a peer's other
-  // m-line can never leak in), ranked low→high by observed byte rate.
+  // m-line can never leak in), ranked low→high: by the SDP's rid order
+  // when every layer's rid is known, otherwise by observed byte rate of
+  // primary packets (see the M3a note at the top).
   function producer_layers(p) {
     var out = [];
     if (p.plain) {
@@ -511,17 +599,24 @@ function Router(options) {
       var srcs = recv.getSynchronizationSources() || [];
       var st = (p.peer._src_stats) || {};
       var now = Date.now();
+      var order = srcs.length > 1 ? producer_rid_order(p) : null;
+      var ranked = !!order;
       for (var i = 0; i < srcs.length; i++) {
         if (srcs[i].source == null) continue;
         var ssrc = srcs[i].source >>> 0;
         var o = st[ssrc];
+        var rank = (order && o && o.rid) ? order.indexOf(o.rid) : -1;
+        if (rank < 0) ranked = false;
         out.push({
           ssrc:  ssrc,
+          rid:   o ? o.rid || null : null,
+          rank:  rank,
           rate:  o ? (o.rate || o.win_bytes) : 0,
           fresh: !!(o && now - o.last_at < LAYER_STALE_MS),
         });
       }
-      out.sort(function (a, b) { return a.rate - b.rate; });   // r0 … r2
+      if (ranked) out.sort(function (a, b) { return a.rank - b.rank; });   // SDP order: r0 … r2
+      else        out.sort(function (a, b) { return a.rate - b.rate; });   // fallback: thinnest first
     } catch (e) {}
     return out;
   }
@@ -582,32 +677,87 @@ function Router(options) {
     return best;
   }
 
-  // Move a bound consumer onto a different source ssrc: re-key the hot
-  // table, glide the forwarder so the viewer's seq/ts stay continuous,
-  // and take on a keyframe debt — the new layer's frames are useless
-  // until an anchor from IT arrives (#26 settles the debt).
-  function switch_consumer_layer(c, ssrc) {
-    c.last_switch_at = Date.now();
+  function route_add(c, ssrc) {
     var pid = c.producer.peer.id;
     var by = state.routes[pid] || (state.routes[pid] = {});
-    var old = by[c.src_ssrc];
-    if (old) {
-      var oi = old.indexOf(c);
-      if (oi >= 0) old.splice(oi, 1);
-      if (!old.length) delete by[c.src_ssrc];
-    }
-    c.src_ssrc = ssrc;
-    (by[ssrc] || (by[ssrc] = [])).push(c);
-    try { if (c.fwd && typeof c.fwd.switchSource === 'function') c.fwd.switchSource(); } catch (e) {}
-    c.kf_pending = true;
-    c.last_pli_at = 0;              // ask now, don't wait out the retry window
+    var list = by[ssrc] || (by[ssrc] = []);
+    if (list.indexOf(c) < 0) list.push(c);
+  }
+
+  function route_remove(c, ssrc) {
+    var by = state.routes[c.producer.peer.id];
+    var list = by && ssrc != null && by[ssrc];
+    if (!list) return;
+    var i = list.indexOf(c);
+    if (i >= 0) list.splice(i, 1);
+    if (!list.length) delete by[ssrc];
+  }
+
+  // Ask for a move to another layer. The switch does NOT happen here: the
+  // consumer keeps forwarding its current layer and is ALSO routed the
+  // target's packets, which the tap drops until the target's keyframe
+  // arrives — then complete_layer_switch re-bases on that packet. This is
+  // mediasoup's SimulcastConsumer rule. Switching on the very next packet
+  // (what this did before) fed the viewer's decoder delta frames of a
+  // stream it had no reference for, and could re-base on a retransmitted
+  // packet, leaving a sequence hole the viewer never NACKs.
+  function switch_consumer_layer(c, ssrc) {
+    c.last_switch_at = Date.now();
+    set_switch_target(c, ssrc);
+    c.switch_tries = 0;
+    c.last_pli_at = c.last_switch_at;
     request_keyframe(c.producer, ssrc);
+  }
+
+  function set_switch_target(c, ssrc) {
+    if (c.target_ssrc != null && c.target_ssrc !== c.src_ssrc) route_remove(c, c.target_ssrc);
+    c.target_ssrc = ssrc;
+    if (ssrc != null) route_add(c, ssrc);
+  }
+
+  // The target layer's keyframe is here (or we gave up waiting for one we
+  // cannot recognise): move the consumer onto it. The output timestamp is
+  // advanced by the wall time since the last forwarded packet, so the new
+  // layer's frames land where the viewer's playout clock expects them
+  // (no advance at all made the jitter buffer absorb the difference).
+  function complete_layer_switch(c, now) {
+    var ssrc = c.target_ssrc;
+    route_remove(c, c.src_ssrc);
+    c.target_ssrc = null;
+    c.src_ssrc = ssrc;
+    rebase_forwarder(c, now);
+    c.kf_pending = false;           // the packet that completes the switch IS the anchor
+    c.kf_tries = 0;
     if (c.handle) c.handle.currentLayerSsrc = ssrc;
+    _diag(c.id + ' layer switch → ' + ssrc + ' complete');
     // The tap is the hot path: an application (or compat) listener that
     // throws must not abort a layer switch, and must not reach node's
     // uncaught-exception path from inside packet handling.
     try { ev.emit('consumerlayerschange', c.handle, { ssrc: ssrc }); }
     catch (e) { _diag('consumerlayerschange listener threw: ' + (e && e.message)); }
+  }
+
+  // The next forwarded packet starts a new source timeline (layer switch,
+  // resume). Its seq continues at last+1; its timestamp moves on by the
+  // media time that passed, never less than one tick so it can never be
+  // read as part of the frame before it.
+  function rebase_forwarder(c, now) {
+    if (!c.fwd || typeof c.fwd.switchSource !== 'function') return;
+    var elapsed = c.last_fwd_at ? Math.max(0, now - c.last_fwd_at) : 0;
+    var jump = Math.max(1, Math.round(elapsed * clock_rate_of(c.producer.kind) / 1000));
+    try { c.fwd.switchSource(jump); } catch (e) {}
+    c.rebase_pending = true;        // the first packet of the new timeline sets c.base_seq
+  }
+
+  // Has negotiation taken receiving away from this producer's transceiver?
+  // currentDirection is null until the first answer is applied — the
+  // 'track' event fires before that — and null means "not decided yet".
+  function producer_stopped_receiving(p) {
+    var t = p.transceiver;
+    if (!t) return false;
+    if (t.stopped === true || t.direction === 'stopped') return true;
+    var cd = t.currentDirection;
+    return cd === 'stopped' || cd === 'inactive' || cd === 'sendonly';
   }
 
   // What this consumer's OWN link can carry, in bytes/sec to match the
@@ -664,6 +814,7 @@ function Router(options) {
     c.bound = true;
     _diag(c.id + ' cascade4: BIND — forwarding ' + c.producer.ssrc + ' → ssrc=' + c.ssrc + ' pt=' + c.pt);
     c.fwd = new RtpForwarder({ ssrc: c.ssrc, payloadType: c.pt });
+    c.rebase_pending = true;
 
     // Register our injected SSRC with the outbound machinery: SR
     // generation needs the clockRate to compute RTP timestamps at NTP
@@ -694,7 +845,6 @@ function Router(options) {
     // applying — so a consumer never begins life on a layer that is
     // already silent (the freeze seen live: we latched r1 exactly as
     // Chrome shed it, and nothing re-evaluated).
-    var pid = c.producer.peer.id;
     var src = c.producer.ssrc;
     if (c.producer.kind === 'video') {
       var l0 = producer_layers(c.producer);
@@ -703,9 +853,7 @@ function Router(options) {
     }
     c.src_ssrc = src;
     if (c.handle) c.handle.currentLayerSsrc = src;
-    if (!state.routes[pid]) state.routes[pid] = {};
-    if (!state.routes[pid][src]) state.routes[pid][src] = [];
-    state.routes[pid][src].push(c);
+    route_add(c, src);
     refresh_unbound_flags();
 
     // A viewer joining mid-stream can't decode until a keyframe — ask
@@ -750,19 +898,45 @@ function Router(options) {
     };
 
     function tap_inner(rtp, rinfo, info) {
-      if (state.closed || peer.closed || !info) return;
+      if (state.closed || peer.closed || !info || !rtp || rtp.length < 12) return;
+      var nowP = Date.now();   // one clock read for the whole packet
+      var seq = (rtp[2] << 8) | rtp[3];
+
+      var st = peer._src_stats || (peer._src_stats = {});
+      var e = st[info.ssrc];
+      if (!e) {
+        e = st[info.ssrc] = { bytes: 0, win_bytes: 0, win_at: nowP, rate: 0, last_at: 0,
+                              rid: undefined, rid_tries: 0,
+                              max_seq: null, holes: null, hole_count: 0 };
+      }
+
+      // RETRANSMISSIONS (info.isRtx: the transport unwrapped it from the
+      // RTX stream). Chrome uses RTX for two things: repairing a packet
+      // that was NACKed and — far more often — bandwidth PROBES, which are
+      // copies of packets that already arrived. Both used to be treated as
+      // primary traffic: counted into the layer's rate (the probes copy
+      // the LOW layer, which then ranked as the best one) and forwarded to
+      // every viewer (~50% extra downstream of duplicates). Only a packet
+      // that fills a hole we actually saw is a repair the viewer needs as
+      // much as we did; it goes on, everything else stops here, and none
+      // of it counts as layer liveness or volume.
+      if (info.isRtx) {
+        if (!e.holes || !e.holes[seq]) return;
+        delete e.holes[seq];
+        e.hole_count--;
+        forward_to_routes(rtp, info, nowP, seq, true);
+        return;
+      }
 
       // Per-SSRC observation: liveness + volume for every stream this
       // peer sends. Cascade 3c reads it; nothing else may write it.
-      var st = peer._src_stats || (peer._src_stats = {});
-      var e = st[info.ssrc];
-      var nowP = Date.now();   // one clock read for the whole packet
-      if (!e) { e = st[info.ssrc] = { bytes: 0, win_bytes: 0, win_at: nowP, rate: 0, last_at: 0 }; }
       e.bytes += rtp.length; e.win_bytes += rtp.length; e.last_at = nowP;
       if (nowP - e.win_at >= LAYER_RATE_WIN) {
         e.rate = e.win_bytes / ((nowP - e.win_at) / 1000);
         e.win_bytes = 0; e.win_at = nowP;
       }
+      track_holes(e, seq);
+      if (e.rid === undefined) learn_rid(e, rtp, info.ssrc);
 
       // CVO: opt-in per producer. The flag is set only when an app has
       // subscribed to 'videoorientationchange' on the matching Producer.
@@ -784,107 +958,7 @@ function Router(options) {
         }
       }
 
-      var by_ssrc = state.routes[peer.id];
-      var list = by_ssrc && by_ssrc[info.ssrc];
-
-      if (list) {
-        // KEYFRAME ANCHOR RETRY (#26 — the last black window). Measured
-        // chain: Chrome answers a PLI on the bound layer, but the
-        // consumer is still paused (mediasoup's own paused:true
-        // practice) and the forwarder drops the very anchor it is
-        // waiting for; the resume-time requests that follow all land
-        // inside Chrome's keyframe throttle window — it just sent one —
-        // so they are satisfied by the frame we already discarded, and
-        // NOBODY ASKS AGAIN. The viewer decodes nothing forever while
-        // packets pour in ([ms-fwd] climbing, zero [ms-kf]).
-        //
-        // So a consumer carries an explicit debt: from bind and from
-        // every resume it OWES its viewer a keyframe, and the debt is
-        // only settled by a keyframe that actually leaves for it.
-        // Incoming packets are the clock — no new timer, and the retry
-        // stops the instant the anchor gets through.
-        // ONE pass over the route list to learn what this packet needs
-        // parsing for. Two separate scans (keyframe debt, temporal caps)
-        // walked the same array twice per packet for answers that are
-        // almost always both false.
-        var nowT2 = nowP, needKf = false, anyCap = false;
-        for (var ai = 0; ai < list.length; ai++) {
-          var ac = list[ai];
-          if (ac.closed) continue;
-          if (!ac.paused && ac.kf_pending) needKf = true;
-          if (ac.preferred_temporal != null) anyCap = true;
-          if (needKf && anyCap) break;
-        }
-        // The codec name is needed only if we are going to parse.
-        var codecName = (_DBG_KF || needKf || anyCap)
-                        ? producer_codec_name(list[0].producer) : '';
-        var isKf = (_DBG_KF || needKf) ? is_keyframe(rtp, codecName) : false;
-        var tid  = anyCap ? packet_tid(rtp, codecName) : undefined;
-
-        if (_DBG_KF && isKf) {
-          if (!peer._kfLast) peer._kfLast = {};
-          var kk = 'k' + info.ssrc;
-          if (!peer._kfLast[kk] || nowT2 - peer._kfLast[kk] > 500) {
-            peer._kfLast[kk] = nowT2;
-            var live = 0, pausedN = 0;
-            for (var kq = 0; kq < list.length; kq++) {
-              if (list[kq].closed) continue;
-              if (list[kq].paused) pausedN++; else live++;
-            }
-            _diag('[sfu-kf-in] ' + peer.id + ' KEYFRAME ssrc=' + info.ssrc + ' → ' +
-                  live + ' live route(s)' +
-                  (pausedN ? ', ' + pausedN + ' PAUSED (anchor discarded)' : ''));
-          }
-        }
-
-        // Read the TID once per packet, and only when some consumer on
-        // this route actually caps temporal layers — an untouched route
-        // pays one boolean.
-        var tid;
-        var anyCap = false;
-        for (var ti = 0; ti < list.length; ti++) {
-          if (!list[ti].closed && list[ti].preferred_temporal != null) { anyCap = true; break; }
-        }
-        if (anyCap) tid = packet_tid(rtp, producer_codec_name(list[0].producer));
-
-        for (var i = 0; i < list.length; i++) {
-          var c = list[i];
-          if (c.closed || c.paused) continue;
-          // TEMPORAL FILTERING. A packet above the consumer's ceiling is
-          // dropped outright: the encoder guaranteed nothing below it
-          // references it, so the decoder never notices. Packets with no
-          // temporal information (tid === null) always pass — a stream
-          // without temporal structure must not go dark because an app
-          // asked for a low temporal layer.
-          if (c.preferred_temporal != null && tid != null && tid > c.preferred_temporal) {
-            continue;
-          }
-          if (tid != null && tid !== c.current_temporal) {
-            c.current_temporal = tid;
-          }
-          var out = c.fwd.forward(rtp);
-          if (out) { try { c.peer.manager.sendRtp(out); } catch (e) {} }
-          if (c.kf_pending) {
-            if (isKf) {
-              c.kf_pending = false;
-              c.kf_tries = 0;
-              _diag(c.id + ' keyframe anchor delivered — debt settled');
-            } else if (nowT2 - c.last_pli_at > KF_RETRY_MS) {
-              c.last_pli_at = nowT2;
-              c.kf_tries = (c.kf_tries || 0) + 1;
-              if (c.kf_tries > KF_MAX_RETRIES) {
-                c.kf_pending = false;
-                _diag(c.id + ' anchor debt written off after ' + (c.kf_tries - 1) +
-                      ' tries (codec keyframes not recognised?)');
-              } else {
-                _diag(c.id + ' still without an anchor — re-requesting keyframe');
-                request_keyframe(c.producer, c.src_ssrc);
-              }
-            }
-          }
-        }
-        return;
-      }
+      if (forward_to_routes(rtp, info, nowP, seq, false)) return;
       // unknown ssrc from this peer — a producer may just have started
       // (pre-bind)… OR a bound producer's stream has MOVED to a new
       // ssrc. Harvest #25, caught live under the official demo: Chrome
@@ -905,6 +979,191 @@ function Router(options) {
         refresh_unbound_flags();
       }
     }
+    // Remember which packets of this stream never arrived, so a
+    // retransmission can be told apart from a probe (see the RTX branch
+    // of the tap). Costs nothing while the stream is clean.
+    function track_holes(e, seq) {
+      if (e.max_seq == null) { e.max_seq = seq; return; }
+      var d = seq_delta(seq, e.max_seq);
+      if (d > 0) {
+        if (d > 1 && d <= GAP_MEMORY) {
+          if (!e.holes) e.holes = {};
+          for (var s = 1; s < d; s++) {
+            var k = (e.max_seq + s) & 0xFFFF;
+            if (!e.holes[k]) { e.holes[k] = true; e.hole_count++; }
+          }
+        }
+        e.max_seq = seq;
+        // Bounded: holes older than GAP_MEMORY are past any NACK's reach.
+        if (e.hole_count > GAP_MEMORY) {
+          for (var hk in e.holes) {
+            if (seq_delta(e.max_seq, +hk) > GAP_MEMORY) { delete e.holes[hk]; e.hole_count--; }
+          }
+        }
+      } else if (d < 0 && e.holes && e.holes[seq]) {
+        delete e.holes[seq];            // late (reordered) arrival filled it
+        e.hole_count--;
+      }
+    }
+
+    // Which simulcast layer is this ssrc? The rtp-stream-id extension
+    // says so on the stream's first packets. BUNDLE requires one id per
+    // URI across m-lines, so any of this peer's producers can answer.
+    function learn_rid(e, rtp, ssrc) {
+      var id = null;
+      for (var i = 0; i < state.producers.length && id == null; i++) {
+        var p = state.producers[i];
+        if (p.peer === peer && !p.plain && p.transceiver) id = producer_ext_id(p, RID_EXT_URI);
+      }
+      var buf = (id != null) ? readExtension(rtp, id) : null;
+      if (buf && buf.length) {
+        e.rid = Buffer.from(buf).toString('ascii');
+        _diag(peer.id + ' ssrc ' + ssrc + ' → rid=' + e.rid);
+      } else if (++e.rid_tries > RID_LEARN_MAX_PKTS) {
+        e.rid = null;                   // this stream carries no rid
+      }
+    }
+
+    // Forward one packet to every consumer routed on its ssrc. Returns
+    // false when nothing is routed there (the caller's unknown-ssrc path).
+    // `repair` marks a retransmission that filled a hole: it goes only to
+    // consumers already forwarding this ssrc, and never re-bases a
+    // timeline or settles a keyframe debt (it is an old packet).
+    function forward_to_routes(rtp, info, nowP, seq, repair) {
+      var by_ssrc = state.routes[peer.id];
+      var list = by_ssrc && by_ssrc[info.ssrc];
+      if (!list) return false;
+
+      // KEYFRAME ANCHOR RETRY (#26 — the last black window). Measured
+      // chain: Chrome answers a PLI on the bound layer, but the
+      // consumer is still paused (mediasoup's own paused:true
+      // practice) and the forwarder drops the very anchor it is
+      // waiting for; the resume-time requests that follow all land
+      // inside Chrome's keyframe throttle window — it just sent one —
+      // so they are satisfied by the frame we already discarded, and
+      // NOBODY ASKS AGAIN. The viewer decodes nothing forever while
+      // packets pour in ([ms-fwd] climbing, zero [ms-kf]).
+      //
+      // So a consumer carries an explicit debt: from bind and from
+      // every resume it OWES its viewer a keyframe, and the debt is
+      // only settled by a keyframe that actually leaves for it.
+      // Incoming packets are the clock — no new timer, and the retry
+      // stops the instant the anchor gets through.
+      // ONE pass over the route list to learn what this packet needs
+      // parsing for: a keyframe debt or a pending layer switch onto this
+      // ssrc needs the keyframe bit, a temporal cap needs the TID. (The
+      // TID scan used to be repeated in a second loop, and the TID parsed
+      // twice per packet.)
+      var needKf = false, anyCap = false;
+      for (var ai = 0; ai < list.length; ai++) {
+        var ac = list[ai];
+        if (ac.closed) continue;
+        if (!ac.paused && (ac.kf_pending || ac.target_ssrc === info.ssrc)) needKf = true;
+        if (ac.preferred_temporal != null) anyCap = true;
+        if (needKf && anyCap) break;
+      }
+      // The codec name is needed only if we are going to parse.
+      var codecName = (_DBG_KF || needKf || anyCap)
+                      ? producer_codec_name(list[0].producer) : '';
+      var isKf = (_DBG_KF || needKf) ? is_keyframe(rtp, codecName) : false;
+      var tid  = anyCap ? packet_tid(rtp, codecName) : undefined;
+
+      if (_DBG_KF && isKf && !repair) {
+        if (!peer._kfLast) peer._kfLast = {};
+        var kk = 'k' + info.ssrc;
+        if (!peer._kfLast[kk] || nowP - peer._kfLast[kk] > 500) {
+          peer._kfLast[kk] = nowP;
+          var live = 0, pausedN = 0;
+          for (var kq = 0; kq < list.length; kq++) {
+            if (list[kq].closed) continue;
+            if (list[kq].paused) pausedN++; else live++;
+          }
+          _diag('[sfu-kf-in] ' + peer.id + ' KEYFRAME ssrc=' + info.ssrc + ' → ' +
+                live + ' live route(s)' +
+                (pausedN ? ', ' + pausedN + ' PAUSED (anchor discarded)' : ''));
+        }
+      }
+
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i];
+        if (c.closed || c.paused) continue;
+
+        if (c.src_ssrc !== info.ssrc) {
+          // This consumer is here for a PENDING SWITCH onto this layer:
+          // nothing of it is forwarded until its keyframe arrives. A codec
+          // whose keyframes we cannot read, or a producer that ignored
+          // KF_MAX_RETRIES requests, switches anyway rather than never —
+          // and then carries the ordinary keyframe debt.
+          if (repair || c.target_ssrc !== info.ssrc) continue;
+          if (!isKf && codecName && (c.switch_tries || 0) <= KF_MAX_RETRIES) {
+            if (nowP - c.last_pli_at > KF_RETRY_MS) {
+              c.last_pli_at = nowP;
+              c.switch_tries = (c.switch_tries || 0) + 1;
+              request_keyframe(c.producer, info.ssrc);
+            }
+            continue;
+          }
+          complete_layer_switch(c, nowP);
+          if (!isKf) { c.kf_pending = true; c.kf_tries = 0; }
+        }
+
+        // TEMPORAL FILTERING. A packet above the consumer's ceiling is
+        // dropped outright: the encoder guaranteed nothing below it
+        // references it, so the decoder never notices. Packets with no
+        // temporal information (tid === null) always pass — a stream
+        // without temporal structure must not go dark because an app
+        // asked for a low temporal layer.
+        if (c.preferred_temporal != null && tid != null && tid > c.preferred_temporal) {
+          continue;
+        }
+        if (tid != null && tid !== c.current_temporal) {
+          c.current_temporal = tid;
+        }
+
+        // TIMELINE GUARD. The forwarder maps seq by a fixed offset from
+        // its last re-base, so a packet from BEFORE that point (reordered,
+        // or a repair of an older hole) would land on output numbers the
+        // viewer already got from the previous timeline. The first packet
+        // after a re-base sets the base; anything older is dropped until
+        // the stream is far enough along that reordering is over (the
+        // signed 16-bit compare would wrap after 32768 packets).
+        if (c.rebase_pending) {
+          if (repair) continue;
+          c.rebase_pending = false;
+          c.base_seq = seq;
+        } else if (c.base_seq != null) {
+          var bd = seq_delta(seq, c.base_seq);
+          if (bd < 0) continue;
+          if (bd > 4096) c.base_seq = null;
+        }
+
+        var out = c.fwd.forward(rtp);
+        if (out) {
+          c.last_fwd_at = nowP;
+          try { c.peer.manager.sendRtp(out); } catch (e) {}
+        }
+        if (c.kf_pending && !repair) {
+          if (isKf) {
+            c.kf_pending = false;
+            c.kf_tries = 0;
+            _diag(c.id + ' keyframe anchor delivered — debt settled');
+          } else if (nowP - c.last_pli_at > KF_RETRY_MS) {
+            c.last_pli_at = nowP;
+            c.kf_tries = (c.kf_tries || 0) + 1;
+            if (c.kf_tries > KF_MAX_RETRIES) {
+              c.kf_pending = false;
+              _diag(c.id + ' anchor debt written off after ' + (c.kf_tries - 1) +
+                    ' tries (codec keyframes not recognised?)');
+            } else {
+              _diag(c.id + ' still without an anchor — re-requesting keyframe');
+              request_keyframe(c.producer, c.src_ssrc);
+            }
+          }
+        }
+      }
+      return true;
+    }
+
     peer.manager.ev.on('rtp', peer._tap);
     // One listener per peer on a shared emitter: past ten peers node
     // starts warning about a leak that isn't one. Say so explicitly
@@ -991,6 +1250,12 @@ function Router(options) {
       id: p.id, kind: p.kind, peerId: peer.id,
       requestKeyframe: function () { request_keyframe(p); },
       close: function () { close_producer(p); },
+      get closed() { return p.closed; },
+      // The live layer ssrcs, low→high — how the compat layer scores a
+      // rid-simulcast producer, whose rtpParameters name no ssrc at all.
+      get layers() {
+        return producer_layers(p).map(function (l) { return { ssrc: l.ssrc, rid: l.rid }; });
+      },
       // Turned on by the compat layer when an app subscribes; the tap
       // does no CVO work for producers nobody is watching.
       watchVideoOrientation: function (on) {
@@ -1044,6 +1309,7 @@ function Router(options) {
       id: p.id, kind: p.kind, peerId: peer.id,
       requestKeyframe: function () { request_keyframe(p); },
       close: function () { close_producer(p); },
+      get closed() { return p.closed; },
       // The transport calls this for every packet it receives.
       push: function (rtp, info) {
         if (p.closed || state.closed) return;
@@ -1073,18 +1339,64 @@ function Router(options) {
   function close_consumer(c) {
     if (c.closed) return;
     c.closed = true;
-    var by_ssrc = state.routes[c.producer.peer.id];
-    var key = (c.src_ssrc != null) ? c.src_ssrc : c.producer.ssrc;
-    if (by_ssrc && key != null && by_ssrc[key]) {
-      var list = by_ssrc[key];
-      var i = list.indexOf(c);
-      if (i >= 0) list.splice(i, 1);
-      if (!list.length) delete by_ssrc[key];
-    }
+    route_remove(c, (c.src_ssrc != null) ? c.src_ssrc : c.producer.ssrc);
+    if (c.target_ssrc != null) route_remove(c, c.target_ssrc);
     var idx = state.consumers.indexOf(c);
     if (idx >= 0) state.consumers.splice(idx, 1);
     refresh_unbound_flags();
+
+    // RETIRE THE M-LINE. Removing the route only stopped the packets: the
+    // sendonly transceiver lived on, so the viewer kept a frozen tile of
+    // someone who had left, and every later consume added a NEW m-line
+    // (nothing was ever free to reuse). stop() ends the viewer's track
+    // through the renegotiation it triggers (negotiationneeded), and the
+    // stopped m-section becomes reusable. A closed pc has nothing left to
+    // renegotiate — and stop() would throw there.
+    if (c.transceiver && !c.peer.plain && !c.peer.closed &&
+        c.peer.pc && c.peer.pc.signalingState !== 'closed') {
+      unregister_outbound(c);
+      try { c.transceiver.stop(); }
+      catch (e) { _diag(c.id + ' transceiver.stop() failed: ' + (e && e.message)); }
+    }
+
+    // A consume still waiting on its callback is owed an answer: the
+    // caller (Room's pairing, the compat layer's consume()) would
+    // otherwise wait forever on a consumer that no longer exists.
+    if (c.cb) {
+      var cb = c.cb; c.cb = null;
+      try { cb(new Error('consume: consumer closed before it was ready (' +
+                         (c.peer.closed ? 'consuming peer left' : 'producer closed') + ')')); }
+      catch (e) { _diag('consume callback threw: ' + (e && e.message)); }
+    }
     emit_safely('consumerclose', c.handle);
+  }
+
+  // Undo bind_consumer's registerOutboundStream: without it the transport
+  // keeps writing Sender Reports for a stream that ended (one per closed
+  // consumer, forever) and keeps the RTX mapping for its ssrc.
+  // webrtc-server's manager.unregisterOutboundStream does this. The
+  // direct-state branch below is only for an older webrtc-server that
+  // lacks it (before, sfu-server always reached into state by hand).
+  function unregister_outbound(c) {
+    if (!c.bound || c.ssrc == null) return;
+    var mgr = c.peer.manager;
+    var rtxSsrc = null;
+    try { rtxSsrc = c.transceiver.sender.rtxSsrc; } catch (e) {}
+    try {
+      if (typeof mgr.unregisterOutboundStream === 'function') {
+        mgr.unregisterOutboundStream(c.ssrc);
+        return;
+      }
+      var ms = mgr.state;
+      if (!ms) return;
+      if (ms.outboundStats) delete ms.outboundStats[c.ssrc];
+      if (ms.rtxStreams)    delete ms.rtxStreams[c.ssrc];
+      var stamper = ms.headerStamper;
+      if (stamper && typeof stamper.clearSsrc === 'function') {
+        stamper.clearSsrc(c.ssrc);
+        if (rtxSsrc != null) stamper.clearSsrc(rtxSsrc);
+      }
+    } catch (e) { _diag(c.id + ' unregister outbound failed: ' + (e && e.message)); }
   }
 
   /* ── Public: addPlainPeer ─────────────────────────────────────
@@ -1148,6 +1460,7 @@ function Router(options) {
         return out;
       },
       close: function () { close_peer(peer); },
+      get closed() { return peer.closed; },
       consume: function (producer_handle, cb2, plainOpts) {
         return consume(peer, producer_handle, cb2, plainOpts);
       },
@@ -1202,6 +1515,7 @@ function Router(options) {
         consume(peer, producer_handle, cb);
       },
       close: function () { close_peer(peer); },
+      get closed() { return peer.closed; },
       get producers() {
         var out = [];
         for (var i = 0; i < state.producers.length; i++) {
@@ -1254,6 +1568,18 @@ function Router(options) {
     peer._listeners.track = function (event) {
       _diag(peer.id + ' trigger: track event (kind=' + (event && event.track && event.track.kind) + ')');
       if (peer.closed || !event || !event.track) return;
+      // A 'track' on one of OUR consumer transceivers is not a producer.
+      // It happens when the peer re-adds a track: JSEP's addTrack reuses
+      // any transceiver whose sender never sent — which includes the
+      // recvonly ones our consumers created on its side — and offers it
+      // sendrecv. Our transceiver stays sendonly, so the answer tells the
+      // peer not to send there, and the "producer" this used to create
+      // never got an ssrc: every consume of it timed out (producerSsrc=null).
+      if (is_consumer_transceiver(peer, event.transceiver)) {
+        _diag(peer.id + ' track event on our own consumer transceiver (mid=' +
+              (event.transceiver && event.transceiver.mid) + ') — not a producer');
+        return;
+      }
       add_producer(peer, event.track, event.transceiver);
       run_cascades();
     };
@@ -1264,13 +1590,50 @@ function Router(options) {
     peer._listeners.signaling = function () {
       _diag(peer.id + ' trigger: signalingstatechange state=' + pc.signalingState +
             ' RD=' + !!pc.remoteDescription);
+      if (pc.signalingState === 'closed') return close_peer(peer);
       run_cascades();
     };
     pc.addEventListener('signalingstatechange', peer._listeners.signaling);
 
+    // PEER LIFETIME. This listened for connectionState 'closed'/'failed'
+    // only, and neither ever arrives for the common case: pc.close()
+    // fires NO event (W3C 4.4.1.5 — close() changes the states silently),
+    // and that is exactly how the README's server ends a participant
+    // (socket close → pc.close()). The departed peer stayed in the room:
+    // its taps and consumers kept running, Room paired every new producer
+    // with it, and that consume timed out into an unhandled 'error'
+    // event that crashed the process. So:
+    //   - close() itself is the trigger: wrapped on this instance, the
+    //     one place a local close is guaranteed to pass through
+    //   - 'failed' (and a 'closed' a wrapper may report) is final
+    //   - 'disconnected' gets DISCONNECT_GRACE_MS to recover first
+    var orig_close = pc.close;
+    var had_own_close = Object.prototype.hasOwnProperty.call(pc, 'close');
+    var close_hook = function () {
+      try { return orig_close.apply(pc, arguments); }
+      finally { close_peer(peer); }
+    };
+    pc.close = close_hook;
+    peer._unhook_close = function () {
+      if (pc.close !== close_hook) return;          // someone wrapped it after us: leave theirs
+      if (had_own_close) pc.close = orig_close; else delete pc.close;
+    };
+
     peer._listeners.connstate = function () {
       var s = pc.connectionState;
-      if (s === 'closed' || s === 'failed') close_peer(peer);
+      if (s === 'closed' || s === 'failed') return close_peer(peer);
+      if (s === 'disconnected') {
+        if (peer._disconnect_timer) return;
+        _diag(peer.id + ' disconnected — closing in ' + DISCONNECT_GRACE_MS + 'ms unless it recovers');
+        peer._disconnect_timer = setTimeout(function () {
+          peer._disconnect_timer = null;
+          if (pc.connectionState !== 'connected') close_peer(peer);
+        }, DISCONNECT_GRACE_MS);
+        if (peer._disconnect_timer.unref) peer._disconnect_timer.unref();
+      } else if (peer._disconnect_timer) {
+        clearTimeout(peer._disconnect_timer);
+        peer._disconnect_timer = null;
+      }
     };
     pc.addEventListener('connectionstatechange', peer._listeners.connstate);
 
@@ -1289,6 +1652,17 @@ function Router(options) {
     }
 
     attach_peer_tap(peer);
+
+    // Handed a pc that is already closed: nothing will ever announce it.
+    if (pc.signalingState === 'closed') close_peer(peer);
+  }
+
+  function is_consumer_transceiver(peer, t) {
+    if (!t) return false;
+    for (var i = 0; i < state.consumers.length; i++) {
+      if (state.consumers[i].peer === peer && state.consumers[i].transceiver === t) return true;
+    }
+    return false;
   }
 
   function consume(peer, producer_handle, cb, plainOpts) {
@@ -1321,6 +1695,11 @@ function Router(options) {
       pt:   (plainOpts && plainOpts.pt   != null) ? plainOpts.pt : null,
       fwd: null, bound: false, paused: false,
       src_ssrc: null,          // the LAYER this consumer forwards (M3a)
+      target_ssrc: null,       // layer it is switching to, once a keyframe of it arrives
+      switch_tries: 0,         // keyframe requests sent to target_ssrc
+      rebase_pending: false,   // next forwarded packet starts a new timeline
+      base_seq: null,          // first input seq of the current timeline
+      last_fwd_at: 0,          // wall time of the last packet sent (ts advance)
       last_switch_at: 0,       // switch-rate floor (see LAYER_SWITCH_MIN_MS)
       preferred_spatial: null, // ceiling set by the app (M3b); null = best available
       preferred_temporal: null,// TID ceiling (M3c); null = all temporal layers
@@ -1334,7 +1713,12 @@ function Router(options) {
       resume: function () {
         if (c.closed || !c.bound) return;
         c.paused = false;
-        c.fwd.switchSource(0);           // re-base the timeline it slept through
+        // Re-base the timeline it slept through, advanced by the time it
+        // slept. switchSource(0) restarted the output timestamps where
+        // they stopped, so after a 5 s pause every frame looked 5 s late
+        // against the viewer's playout clock and its jitter buffer grew
+        // to seconds instead of re-syncing.
+        rebase_forwarder(c, Date.now());
         c.last_pli_at = Date.now();
         if (p.kind === 'video') c.kf_pending = true;   // the debt returns on every resume
         request_keyframe(p, c.src_ssrc); // fresh decode point, from OUR layer
@@ -1394,6 +1778,8 @@ function Router(options) {
     if (peer.wrapper && peer._listeners.wrapperbeat) {
       try { peer.wrapper.off('statechange', peer._listeners.wrapperbeat); } catch (e) {}
     }
+    if (peer._disconnect_timer) { clearTimeout(peer._disconnect_timer); peer._disconnect_timer = null; }
+    if (peer._unhook_close) { try { peer._unhook_close(); } catch (e) {} }
     if (peer.attached) {
       try { peer.manager.ev.off('rtp', peer._tap); } catch (e) {}
       try { peer.manager.ev.off('pli', peer._pli); } catch (e) {}
@@ -1416,7 +1802,7 @@ function Router(options) {
     delete state.routes[peer.id];
     var idx = state.peers.indexOf(peer);
     if (idx >= 0) state.peers.splice(idx, 1);
-    ev.emit('peerclose', peer.handle);
+    emit_safely('peerclose', peer.handle);
   }
 
   this.close = function () {
@@ -1475,10 +1861,29 @@ function Room(options) {
   var closed = false;
 
   function pair(peer_handle, producer_handle) {
+    if (peer_handle.closed || producer_handle.closed) return;
     peer_handle.consume(producer_handle, function (err, consumer_handle) {
-      if (err) { ev.emit('error', err, { peer: peer_handle.id, producer: producer_handle.id }); return; }
-      emit_safely('consumer', consumer_handle);
+      if (!err) { emit_safely('consumer', consumer_handle); return; }
+      // Somebody left while the consume was in flight: not a failure,
+      // just a pairing that no longer has two ends.
+      if (peer_handle.closed || producer_handle.closed) {
+        _diag('room: pairing ' + producer_handle.id + ' → ' + peer_handle.id +
+              ' dropped (' + err.message + ')');
+        return;
+      }
+      report_error(err, { peer: peer_handle.id, producer: producer_handle.id });
     });
+  }
+
+  // 'error' is special to EventEmitter: emitted with no listener it
+  // THROWS — here from inside a timer, i.e. an uncaught exception that
+  // takes the whole server down over one participant's failed consume.
+  // The README's own Room example has no 'error' listener. A routing
+  // failure is worth reporting, never worth a crash.
+  function report_error(err, ctx) {
+    if (ev.listenerCount('error') > 0) { emit_safely('error', err, ctx); return; }
+    console.warn('[sfu-server] room: ' + (err && err.message) + ' ' + JSON.stringify(ctx) +
+                 " (add room.on('error') to handle this)");
   }
 
   router.on('producer', function (producer_handle, owner_handle) {

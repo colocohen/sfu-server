@@ -1967,12 +1967,36 @@ function WebRtcTransport(opts, cb) {
           return Math.max(0, Math.min(10, Math.round(10 - ratio * 20)));
         }
         state.producers.forEach(function (p) {
-          var enc = (p.rtpParameters.encodings || [])[0] || {};
-          if (enc.ssrc == null) return;
-          var sc = [{ ssrc: enc.ssrc >>> 0, score: score_for(enc.ssrc) }];
-          var prev = (p.score && p.score[0] && p.score[0].score);
+          // One entry per encoding, as mediasoup reports it. A rid-based
+          // simulcast producer (Chrome's default) names no ssrc in its
+          // rtpParameters, and returning early on that left it without a
+          // score or a 'score' event for its whole life; the engine knows
+          // the ssrcs it learned on the wire, low→high.
+          var encs = p.rtpParameters.encodings || [];
+          var ssrcs = [];
+          if (encs.length && encs[0].ssrc != null) {
+            encs.forEach(function (e, i) {
+              if (e.ssrc != null) ssrcs.push({ encodingIdx: i, ssrc: e.ssrc >>> 0, rid: e.rid });
+            });
+          } else {
+            var h = p._sfuHandle && p._sfuHandle();
+            var lys = [];
+            try { lys = (h && h.layers) || []; } catch (e) {}
+            lys.forEach(function (l, i) {
+              var idx = i;
+              if (l.rid != null) {
+                for (var k = 0; k < encs.length; k++) if (encs[k].rid === l.rid) { idx = k; break; }
+              }
+              ssrcs.push({ encodingIdx: idx, ssrc: l.ssrc >>> 0, rid: l.rid != null ? l.rid : undefined });
+            });
+          }
+          if (!ssrcs.length) return;
+          var sc = ssrcs.map(function (x) {
+            return { encodingIdx: x.encodingIdx, ssrc: x.ssrc, rid: x.rid, score: score_for(x.ssrc) };
+          });
+          var changed = JSON.stringify(sc) !== JSON.stringify(p.score);
           p._setScore(sc);
-          if (prev !== sc[0].score) { p._emit('score', sc); p.observer.emit('score', sc); }
+          if (changed) { p._emit('score', sc); p.observer.emit('score', sc); }
         });
         state.consumers.forEach(function (c) {
           var enc = (c.rtpParameters.encodings || [])[0] || {};
@@ -2727,14 +2751,10 @@ function WebRtcTransport(opts, cb) {
   }
 
   this.close       = function () { teardown(null); };
-  this.routerClosed = function () {
-    ev.emit('routerclose');
-    teardown('routerclose');
-  };
-  this.listenServerClosed = function () {
-    ev.emit('listenserverclose');
-    teardown('listenserverclose');
-  };
+  // teardown(reason) emits the event itself; emitting it here as well
+  // made every listener run twice.
+  this.routerClosed = function () { teardown('routerclose'); };
+  this.listenServerClosed = function () { teardown('listenserverclose'); };
   this._routerClosed = function () { teardown('routerclose'); };
 
   this.on   = function (n, f) { ev.on(n, f);   return self; };
@@ -2854,7 +2874,7 @@ function Router(options, workerSettings) {
     dataProducersById: {},     // id → DataProducer
     pipePairs:         {},     // destination router id → pipe transport pair
     dataConsumersById: {},      // id → DataConsumer
-    claimed: [],                // engine producer handles already claimed
+    claimed: [],                // engine producer handles no produce() has claimed yet
     pendingClaims: [],          // { peerId, kind, cb }
     appData: (options && options.appData) || {},
   };
@@ -2882,7 +2902,9 @@ function Router(options, workerSettings) {
       var pc = state.pendingClaims[i];
       if (pc.peerId !== ownerHandle.id || pc.kind !== handle.kind) continue;
       state.pendingClaims.splice(i, 1);
-      state.claimed.push(handle);
+      // Delivered straight to its claim: it never enters the unclaimed
+      // pool. (It used to be pushed there unmarked, so a later produce()
+      // of the same kind could claim the same engine producer again.)
       pc.cb(handle);
       return;
     }
@@ -2958,6 +2980,8 @@ function Router(options, workerSettings) {
   });
 
   state.sfuRouter.on('producerclose', function (handle) {
+    var ci = state.claimed.indexOf(handle);
+    if (ci >= 0) state.claimed.splice(ci, 1);
     // Every consumer of this producer must hear 'producerclose' — that
     // is the event the app forwards so the client tears its <video> down.
     var owner = null;
@@ -2972,10 +2996,14 @@ function Router(options, workerSettings) {
 
   this._claimSfuProducer = function (peerHandle, kind, cb) {
     // Already arrived?
+    // The pool holds only handles nobody has claimed yet: a claim takes
+    // its handle out (it used to stay forever, so the array grew by one
+    // per producer for the router's lifetime), and so does the engine
+    // closing one that was never claimed (see 'producerclose').
     for (var i = 0; i < state.claimed.length; i++) {
       var h = state.claimed[i];
-      if (h.peerId === peerHandle.id && h.kind === kind && !h._msClaimed) {
-        h._msClaimed = true;
+      if (h.peerId === peerHandle.id && h.kind === kind) {
+        state.claimed.splice(i, 1);
         return cb(h);
       }
     }
