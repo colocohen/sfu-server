@@ -329,11 +329,29 @@ export function getConsumerRtpParameters(opts) {
 
   // 4. Encodings — exactly one. An SFU consumer always sees a single
   //    continuous stream: RtpForwarder rewrites simulcast layer switches
-  //    into one seq/ts space (switchSource re-bases), so the consumer
-  //    never learns there were layers. When layer selection lands (M3),
-  //    scalabilityMode goes here — the shape does not change.
+  //    into one seq/ts space (switchSource re-bases).
   var encoding = { ssrc: ssrc };
   if (rtxOut && rtxSsrc != null) encoding.rtx = { ssrc: rtxSsrc };
+  //    ...but it does say what layers exist behind it, as mediasoup does:
+  //    the producer's scalabilityMode, and under simulcast L<encodings>T<t>.
+  //    Apps read it to offer layer selection (the mediasoup demo derives
+  //    spatialLayers from it); without it a 3-layer simulcast consumer
+  //    read as one layer and could not be switched from the UI. And the
+  //    largest maxBitrate of any encoding, which mediasoup honours too.
+  var pEncs = producerRtpParameters.encodings || [];
+  var withMode = null;
+  for (var pe = 0; pe < pEncs.length; pe++) { if (pEncs[pe] && pEncs[pe].scalabilityMode) { withMode = pEncs[pe]; break; } }
+  var scalabilityMode = withMode ? withMode.scalabilityMode : undefined;
+  if (pEncs.length > 1) {
+    var tm = /^[LS]([1-9]\d{0,1})T([1-9]\d{0,1})/.exec(scalabilityMode || '');
+    scalabilityMode = 'L' + pEncs.length + 'T' + (tm ? Number(tm[2]) : 1);
+  }
+  if (scalabilityMode) encoding.scalabilityMode = scalabilityMode;
+  var maxBr = 0;
+  for (var pb = 0; pb < pEncs.length; pb++) {
+    if (pEncs[pb] && pEncs[pb].maxBitrate && pEncs[pb].maxBitrate > maxBr) maxBr = pEncs[pb].maxBitrate;
+  }
+  if (maxBr) encoding.maxBitrate = maxBr;
 
   return {
     mid:              mid != null ? String(mid) : undefined,

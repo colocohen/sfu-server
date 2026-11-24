@@ -50,6 +50,7 @@
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
+import net from 'node:net';
 import os from 'node:os';
 
 import { RTCPeerConnection, RTCSessionDescription, WebRTCRouter } from 'webrtc-server';
@@ -341,6 +342,104 @@ function host_ipv4_addresses() {
 
 // mediasoup's PortManager: start at a random port of the range and take the
 // next one while a port is in use, so a firewall opened for the range holds.
+// The UDP entries of mediasoup's listenInfos (or legacy listenIps, whose
+// strings and { ip, announcedIp } objects are UDP too), as { ip, announced }.
+// TCP entries are left out: this layer listens on UDP only, and an entry
+// read regardless of protocol turned the demo's
+//   [{ protocol:'udp', ip, port }, { protocol:'tcp', ip, port }]
+// into TWO identical UDP host candidates.
+function udp_listen_infos(infos) {
+  var out = [];
+  (infos || []).forEach(function (i) {
+    if (typeof i === 'string') { out.push({ ip: i, announced: null, info: { ip: i } }); return; }
+    if (!i || (i.protocol && i.protocol !== 'udp')) return;
+    out.push({ ip: i.ip || null, announced: i.announcedAddress || i.announcedIp || null, info: i });
+  });
+  return out;
+}
+// The TCP entries, the same shape. ICE over TCP (RFC 6544, passive): the
+// client connects, and webrtc-server's WebRTCRouter.tcp() carries the
+// checks, DTLS and media over that connection (RFC 4571 framing). These
+// entries used to be dropped — mediasoup's enableTcp / forceTcp (the
+// demo's forceTcp=true: enableUdp false) left no usable candidate at all.
+function tcp_listen_infos(infos) {
+  var out = [];
+  (infos || []).forEach(function (i) {
+    if (!i || typeof i === 'string' || i.protocol !== 'tcp') return;
+    out.push({ ip: i.ip || null, announced: i.announcedAddress || i.announcedIp || null, info: i });
+  });
+  return out;
+}
+function listen_tcp_in_range(method, range, ip, cb) {
+  if (range.max < range.min) {
+    return cb(new TypeError(method + ': maxPort cannot be less than minPort (' + range.min + '-' + range.max + ')'));
+  }
+  var size = range.max - range.min + 1;
+  var start = Math.floor(Math.random() * size);
+  (function attempt(n) {
+    if (n === size) {
+      return cb(new Error('no more available ports [protocol:tcp, portRange:' + range.min + '-' + range.max + ']'));
+    }
+    var srv = net.createServer();
+    var on_error = function (err) {
+      try { srv.close(); } catch (e) {}
+      if (err.code === 'EADDRINUSE') attempt(n + 1); else cb(err);
+    };
+    srv.once('error', on_error);
+    srv.listen({ host: ip, port: range.min + (start + n) % size }, function () {
+      srv.removeListener('error', on_error);
+      cb(null, srv);
+    });
+  })(0);
+}
+// A listen entry's port range (mediasoup: portRange, else port, else the
+// worker-wide default).
+function range_of_info(info, dflt) {
+  if (info && info.portRange && info.portRange.min && info.portRange.max) return info.portRange;
+  if (info && info.port) return { min: info.port, max: info.port };
+  return dflt;
+}
+// Host candidates as mediasoup builds them: one per address and protocol,
+// UDP above TCP unless preferTcp (and TCP passive, RFC 6544).
+function build_host_candidates(o) {
+  var out = [];
+  function prio(localPref) { return (1 << 24) * 126 + (1 << 8) * localPref + 255; }
+  var udpBase = o.preferTcp ? 32767 : 65535, tcpBase = o.preferTcp ? 65535 : 32767;
+  if (o.enableUdp) (o.udpAddrs || []).forEach(function (ip, idx) {
+    out.push({ foundation: 'udpcandidate' + idx, protocol: 'udp', priority: prio(udpBase - idx),
+               ip: ip, address: ip, port: o.udpPort, type: 'host' });
+  });
+  if (o.enableTcp && o.tcpPort) (o.tcpAddrs || []).forEach(function (ip, idx) {
+    out.push({ foundation: 'tcpcandidate' + idx, protocol: 'tcp', priority: prio(tcpBase - idx),
+               ip: ip, address: ip, port: o.tcpPort, type: 'host', tcpType: 'passive' });
+  });
+  out.sort(function (a, b) { return b.priority - a.priority; });
+  return out;
+}
+
+function is_wildcard_ip(ip) { return !ip || ip === '0.0.0.0' || ip === '::'; }
+// What a UDP listen entry announces: its announced address, else its IP
+// unless that is a wildcard. Unique, in order.
+function announced_of(udpInfos) {
+  var out = [];
+  udpInfos.forEach(function (u) {
+    var a = u.announced || (is_wildcard_ip(u.ip) ? null : u.ip);
+    if (a && out.indexOf(a) < 0) out.push(a);
+  });
+  return out;
+}
+// The address to BIND: the entry's ip, as mediasoup does. Binding 0.0.0.0
+// whatever the entry said answered every ICE check from the address the
+// kernel picks for the reply, not necessarily the one the check was sent
+// to — with listenInfo ip 127.0.0.1 and a browser sending from another
+// local address the response came from that other address, the browser
+// discarded it (RFC 8445 §7.2.5.2.1: a response must come from where the
+// request went), and the official mediasoup demo never got past ICE
+// 'connecting'. A multi-homed server hits the same.
+function bind_ip_of(udpInfos) {
+  return (udpInfos[0] && udpInfos[0].ip) || '0.0.0.0';
+}
+
 function bind_udp_in_range(method, range, ip, cb) {
   if (range.max < range.min) {
     return cb(new TypeError(method + ': maxPort cannot be less than minPort (' + range.min + '-' + range.max + ')'));
@@ -436,11 +535,20 @@ function build_bootstrap_answer(clientDtls) {
 
 /**
  * Synthesize the client's ANSWER to OUR renegotiation offer: mirror
- * every m-line by type+mid; application stays as-is, media flips to
- * recvonly (the client only receives). Client's fingerprint + stored
- * role; ice creds structural (lite agent ignores them).
+ * every m-line by type+mid; application stays as-is, media the client
+ * receives is recvonly. Client's fingerprint + stored role; ice creds
+ * structural (lite agent ignores them).
+ *
+ * A section the CLIENT SENDS on (a producer's, on a send transport) is
+ * answered as the client declared it when it produced — sendonly, its
+ * rids/ssrcs, its extension ids — from producedByMid. Every section used
+ * to come back recvonly: on a send transport any renegotiation of ours
+ * (restartIce, the first to hit it) told the stack the client had stopped
+ * sending, its transceivers went to 'sendonly', and the SFU closed every
+ * producer of that client — in the mediasoup demo, an ICE restart took a
+ * participant's audio and video away from everyone.
  */
-function synth_recv_answer(ourOfferSdp, clientDtls) {
+function synth_recv_answer(ourOfferSdp, clientDtls, producedByMid) {
   var role  = (clientDtls && clientDtls.role) || 'client';
   var setup = MEDIASOUP_DTLS_TO_SETUP[role] || 'passive';
   var fpLines = fingerprint_lines(clientDtls);
@@ -454,6 +562,14 @@ function synth_recv_answer(ourOfferSdp, clientDtls) {
     mids.push(mid);
     var mline = sec.split(/\r?\n/)[0];   // e.g. m=video 9 UDP/TLS/RTP/SAVPF 96 97
     var isApp = mline.indexOf('m=application') === 0;
+    var produced = !isApp && producedByMid && producedByMid[mid];
+    if (produced && !/^m=\w+ 0 /.test(mline) && !/^m=\w+ 0 /.test(produced)) {
+      // the client's own sending section, with the DTLS role of an answer
+      media.push(produced.split(/\r?\n/).map(function (l) {
+        return /^a=setup:/.test(l) ? 'a=setup:' + setup : l;
+      }).join('\r\n'));
+      continue;
+    }
     var lines = [mline, 'c=IN IP4 0.0.0.0', 'a=mid:' + mid,
                  'a=ice-ufrag:msclient', 'a=ice-pwd:msclientmsclientmsclient']
       .concat(fpLines)
@@ -618,9 +734,7 @@ function Producer(opts) {
   Object.defineProperty(this, 'closed',        { get: function () { return state.closed; } });
   Object.defineProperty(this, 'paused',        { get: function () { return state.paused; } });
   Object.defineProperty(this, 'type',          { get: function () {
-    // "simple" | "simulcast" | "svc". Until layer selection lands (M3)
-    // every producer is forwarded as one continuous stream.
-    return (state.rtpParameters.encodings || []).length > 1 ? 'simulcast' : 'simple';
+    return rtp_parameters_type(state.rtpParameters);
   } });
   Object.defineProperty(this, 'score',         { get: function () { return state.score || []; } });
   // RFC-style Coordination of Video Orientation (urn:3gpp:video-orientation):
@@ -836,8 +950,10 @@ function Consumer(opts) {
       if (state.kind !== 'video') return 'simple';
       var pr = state.transport && state.transport._router &&
                state.transport._router._producerById(state.producerId);
-      var enc = pr && pr.rtpParameters && pr.rtpParameters.encodings;
-      return (enc && enc.length > 1) ? 'simulcast' : 'simple';
+      // mediasoup: a consumer on a pipe transport is 'pipe' (it carries
+      // every layer); otherwise it takes its producer's type.
+      if (state.transport && state.transport.type === 'pipe') return 'pipe';
+      return pr ? rtp_parameters_type(pr.rtpParameters) : 'simple';
     },
   });
   Object.defineProperty(this, 'observer',       { get: function () { return observer; } });
@@ -1004,15 +1120,18 @@ function Consumer(opts) {
     var pr = state.transport._router._producerById(state.producerId);
     _diag('consumer ' + state.id.slice(0, 8) + ' requestKeyFrame: producer=' +
           (pr ? 'found' : 'MISSING') + ' handle=' + (pr && pr._sfuHandle() ? 'yes' : 'NO'));
+    // The consumer's OWN layer: under simulcast the producer's nominal
+    // ssrc is just one of its layers, and a keyframe on it did nothing
+    // for a viewer on another.
+    if (state.sfuHandle && typeof state.sfuHandle.requestKeyframe === 'function') {
+      try { state.sfuHandle.requestKeyframe(); } catch (e) {}
+      return Promise.resolve();
+    }
     var p = state.transport._router._producerById(state.producerId);
     if (p && p._sfuHandle()) { try { p._sfuHandle().requestKeyframe(); } catch (e) {} }
     return Promise.resolve();
   };
 
-  // QUALITY surface: recorded, not acted on. Until layer selection lands
-  // (native M3) every consumer receives the one continuous stream the
-  // forwarder produces — which is exactly what a single-layer producer
-  // would give anyway, so the app's media is correct, just not tuned.
   this.setPreferredLayers = function (layers) {
     // ENFORCED (M3b). The engine treats the spatial index as a CEILING,
     // not a pin: if the requested layer is not carrying, cascade 3c
@@ -1080,13 +1199,24 @@ function Consumer(opts) {
   };
 
   /* ── events driven from the router/transport ── */
+  // ASYNCHRONOUS, as in mediasoup: there the consumer hears about its
+  // producer from a worker notification, which arrives after everything
+  // the closing call emits synchronously (the producer's own
+  // 'transportclose', the app's code after transport.close()). We fired
+  // it synchronously and FIRST, and apps observe the order: the official
+  // demo sends 'peerClosed' between the two, and its client then handled
+  // the consumer's close differently than it does against mediasoup.
   this._producerClosed = function () {
-    if (state.closed) return;
-    state.closed = true;
-    if (state.sfuHandle) { try { state.sfuHandle.close(); } catch (e) {} }
-    state.transport._onConsumerClosed(self);
-    ev.emit('producerclose');
-    observer.emit('close');
+    if (state.closed || state.producerClosePending) return;
+    state.producerClosePending = true;
+    setImmediate(function () {
+      if (state.closed) return;
+      state.closed = true;
+      if (state.sfuHandle) { try { state.sfuHandle.close(); } catch (e) {} }
+      state.transport._onConsumerClosed(self);
+      ev.emit('producerclose');
+      observer.emit('close');
+    });
   };
   this.transportClosed = function () { return self._transportClosed(); };
   this._transportClosed = function () {
@@ -1140,6 +1270,22 @@ function Consumer(opts) {
  *  on a DataProducer's channel is fanned out to every DataConsumer of
  *  it whose channel is open.
  * ═══════════════════════════════════════════════════════════════════ */
+
+/* "simple" | "simulcast" | "svc", decided as mediasoup's worker does
+ * (RtpParameters::GetType): several encodings are simulcast; one encoding
+ * with spatial or temporal layers is svc for VP9 (layers on one ssrc,
+ * told apart in the payload) and simulcast otherwise (VP8/H264 temporal
+ * layers, which a consumer selects the same way). Producer.type used to
+ * say 'simple' for a VP9 SVC producer, and apps branch on it. */
+function rtp_parameters_type(rp) {
+  var encs = (rp && rp.encodings) || [];
+  if (encs.length > 1) return 'simulcast';
+  var m = encs[0] && encs[0].scalabilityMode &&
+          /^[LS](\d+)T(\d+)/.exec(encs[0].scalabilityMode);
+  if (!m || (+m[1] <= 1 && +m[2] <= 1)) return 'simple';
+  var codec = ((rp.codecs || [])[0] || {}).mimeType || '';
+  return /\/(vp9|av1)$/i.test(codec) ? 'svc' : 'simulcast';
+}
 
 function DataProducer(opts) {
   var self = this, ev = new EventEmitter(), observer = new EventEmitter();
@@ -1349,9 +1495,18 @@ function DataConsumer(opts) {
   // consumer whose SCTP stream hasn't opened yet drops (SCTP itself is
   // reliable per-message once open; pre-open messages have nowhere to go
   // and mediasoup drops them identically).
-  this._forward = function (data) {
+  this._forward = function (data, fanOpts) {
     if (state.closed) return;
     var ch = state.channel;
+    if (!ch && self._pipeSink) {
+      // pipeToRouter bridge: hand the message, WITH its subchannel
+      // addressing, to the DataProducer on the far router, so consumers
+      // there filter it exactly as consumers here would.
+      state.messagesSent++;
+      state.bytesSent += (typeof data === 'string') ? Buffer.byteLength(data) : (data.byteLength || data.length || 0);
+      self._pipeSink(data, fanOpts || {});
+      return;
+    }
     if (ch) {
       // webrtc transport: out over the negotiated SCTP stream
       if (ch.readyState !== 'open') return;
@@ -1462,13 +1617,18 @@ function DataConsumer(opts) {
     state.transport._onDataConsumerClosed(self);
     observer.emit('close');
   };
+  // Asynchronous, as in mediasoup — see Consumer._producerClosed.
   this._dataProducerClosed = function () {
-    if (state.closed) return;
-    state.closed = true;
-    try { state.channel && state.channel.close(); } catch (e) {}
-    state.transport._onDataConsumerClosed(self);
-    ev.emit('dataproducerclose');
-    observer.emit('close');
+    if (state.closed || state.producerClosePending) return;
+    state.producerClosePending = true;
+    setImmediate(function () {
+      if (state.closed) return;
+      state.closed = true;
+      try { state.channel && state.channel.close(); } catch (e) {}
+      state.transport._onDataConsumerClosed(self);
+      ev.emit('dataproducerclose');
+      observer.emit('close');
+    });
   };
   this.transportClosed = function () { return self._transportClosed(); };
   this._transportClosed = function () {
@@ -1623,16 +1783,23 @@ function WebRtcTransport(opts, cb) {
    *      live: created → 0 candidates → the client had nowhere to send
    *      checks and hung silently).
    */
+  state.enableUdp = opts.enableUdp !== false;
+  state.enableTcp = !!opts.enableTcp;
+  state.preferTcp = !!opts.preferTcp;
+  state.tcpPort = null;
+  state.tcpAnnounced = null;
   if (webRtcServer) {
     state.pc = new RTCPeerConnection({ router: webRtcServer._webrtcRouter });
     state.port = webRtcServer.port;
+    state.tcpPort = webRtcServer._tcpPort;          // null: the server has no tcp entry
+    state.tcpAnnounced = webRtcServer._tcpAnnounced;
     // INBOUND GATE, mode (a): the socket is shared, so we cannot hold
     // the line for one transport without stalling every other peer on
     // the port. See the note on the gate below — this is a VERIFY item.
     state.inboundGated = false;
     after_pc_ready(webRtcServer.announcedAddresses);
   } else {
-    bind_udp_in_range('createWebRtcTransport', opts.portRange, '0.0.0.0', function (err, sock) {
+    bind_udp_in_range('createWebRtcTransport', opts.portRange, opts.bindIp || '0.0.0.0', function (err, sock) {
       if (err) return cb(err);
       state.ownSocket = sock;
       state.port = sock.address().port;
@@ -1661,8 +1828,39 @@ function WebRtcTransport(opts, cb) {
         wr.dispatch(msg, rinfo);
       });
 
-      state.pc = new RTCPeerConnection({ mode: 'lite', router: wr });
-      after_pc_ready(opts.announcedAddresses);
+      if (!state.enableTcp || !opts.tcpPortRange) {
+        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr });
+        return after_pc_ready(opts.announcedAddresses);
+      }
+
+      // ICE-TCP on a port of its own. A connection carries the same
+      // traffic the UDP socket does, so it obeys the same inbound gate:
+      // held, unread, until connect() installs the real fingerprint, then
+      // handed to the router (whose handler starts reading it).
+      listen_tcp_in_range('createWebRtcTransport', opts.tcpPortRange, opts.tcpBindIp || '0.0.0.0', function (err, srv) {
+        if (err) return cb(err);
+        state.tcpServer = srv;
+        state.tcpPort = srv.address().port;
+        state.tcpAnnounced = (opts.tcpAnnounced && opts.tcpAnnounced.length) ? opts.tcpAnnounced : opts.announcedAddresses;
+        // BEFORE the pc: the router gives its TCP carrier only to peer
+        // connections created after tcp() (made the other way round, Chrome's
+        // TCP checks arrived and no response could go back on the connection).
+        var handle = wr.tcp({ port: state.tcpPort });
+        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr });
+        state.heldTcp = [];
+        state.releaseTcp = function () {
+          var held = state.heldTcp; state.heldTcp = [];
+          held.forEach(function (c) { if (!c.destroyed) handle(c); });
+        };
+        srv.on('connection', function (c) {
+          _diag('transport ' + state.id + ' ICE-TCP connection from ' + c.remoteAddress + ':' + c.remotePort +
+                (state.inboundGated ? ' (held until connect)' : ''));
+          state.lastInboundAt = Date.now();
+          if (state.inboundGated) state.heldTcp.push(c);
+          else handle(c);
+        });
+        after_pc_ready(opts.announcedAddresses);
+      });
     });
   }
 
@@ -1860,7 +2058,17 @@ function WebRtcTransport(opts, cb) {
     // credential + certificate materialization through the PUBLIC api,
     // so we parse our own SDP for the params rather than reaching into
     // private state.
-    try { pc.createDataChannel('ms-bootstrap'); } catch (e) {}
+    //
+    // NEGOTIATED, on an id no client allocates. It used to be an ordinary
+    // in-band channel: when SCTP came up it took the DTLS server's first
+    // odd id (1) and sent the client a DCEP OPEN. mediasoup-client numbers
+    // its data producers 0, 1, 2… on its own, so the client's SECOND
+    // produceData (the demo's 'bot', stream 1) failed with "id 1 is already
+    // in use" whenever SCTP won the race against that request. mediasoup
+    // itself opens no channel of its own. A negotiated channel sends
+    // nothing on the wire, and 65534 (the top of the range) is far above
+    // anything a client or our consumeData (from 100 up) will reach.
+    try { pc.createDataChannel('ms-bootstrap', { negotiated: true, id: 65534 }); } catch (e) {}
 
     // ORPHAN CLEANUP path 2 — datagram-silence FALLBACK. History: this
     // was the primary while lite mode had no producer of 'disconnected'
@@ -2034,17 +2242,13 @@ function WebRtcTransport(opts, cb) {
 
       // Candidates are BUILT here (mediasoup-style), not parsed — one
       // host candidate per routable address, all on the bound port.
+      // (ip and address both: mediasoup v3's historical name and the newer alias)
       var addrs = (announced && announced.length) ? announced : host_ipv4_addresses();
-      state.iceCandidates = addrs.map(function (ip, idx) {
-        return {
-          foundation: 'udpcandidate' + idx,
-          protocol:   'udp',
-          priority:   (1 << 24) * 126 + (1 << 8) * (65535 - idx) + 255,
-          ip:         ip,        // mediasoup v3 historical name…
-          address:    ip,        // …and the newer alias; ship both
-          port:       state.port,
-          type:       'host',
-        };
+      state.iceCandidates = build_host_candidates({
+        enableUdp: state.enableUdp, enableTcp: state.enableTcp, preferTcp: state.preferTcp,
+        udpAddrs: addrs, udpPort: state.port,
+        tcpAddrs: (state.tcpAnnounced && state.tcpAnnounced.length) ? state.tcpAnnounced : addrs,
+        tcpPort: state.tcpPort,
       });
       state.iceParameters  = { usernameFragment: p.ufrag, password: p.pwd, iceLite: true };
       state.dtlsParameters = { role: 'auto', fingerprints: [p.fingerprint] };
@@ -2124,7 +2328,12 @@ function WebRtcTransport(opts, cb) {
     return until_closed(pc.createOffer()
       .then(function (offer) { return pc.setLocalDescription(offer); })
       .then(function () {
-        var answer = synth_recv_answer(pc.localDescription.sdp, dtls);
+        var producedByMid = {};
+        state.produceSections.forEach(function (sec) {
+          var mm = sec && /a=mid:(\S+)/.exec(sec);
+          if (mm) producedByMid[mm[1]] = sec;
+        });
+        var answer = synth_recv_answer(pc.localDescription.sdp, dtls, producedByMid);
         return pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer }));
       }));
   }
@@ -2147,6 +2356,7 @@ function WebRtcTransport(opts, cb) {
     // no ICE completion → no ClientHello → no race.
     return renegotiate().then(function () {
       state.inboundGated = false;
+      if (state.releaseTcp) state.releaseTcp();     // ICE-TCP connections held at the gate
       _diag('transport ' + state.id + ' connected — gate open');
     });
   };
@@ -2166,25 +2376,17 @@ function WebRtcTransport(opts, cb) {
     if (kind !== 'audio' && kind !== 'video') {
       return Promise.reject(new TypeError('produce: kind must be "audio" or "video"'));
     }
-    // SIMULCAST TOLERANCE: mediasoup-client sends layered video as
-    // multiple encodings — ssrc-based (each with its own ssrc + FID
-    // rtx) or RID-based (rid strings, no ssrcs; Chrome's default for
-    // send simulcast). Until layer SELECTION lands (native M3) we
-    // accept both shapes and forward one continuous stream — the
-    // engine keys on whichever inbound ssrc it observes, and the
-    // consumer never learns there were layers (RtpForwarder's rewrite
-    // guarantees that). Rejecting here would fail the official demo at
-    // its default settings.
+    // SIMULCAST: mediasoup-client sends layered video as multiple
+    // encodings — ssrc-based (each with its own ssrc + FID rtx) or
+    // RID-based (rid strings, no ssrcs; Chrome's default for send
+    // simulcast). Both shapes are accepted; the engine learns the layers
+    // from the wire and each consumer is given one of them.
     var encodings = (rp && rp.encodings) || [];
     var enc = encodings[0] || {};
     var ridBased = enc.ssrc == null && encodings.some(function (e) { return e.rid != null; });
     if (enc.ssrc == null && !ridBased) {
       return Promise.reject(new TypeError(
         'produce: rtpParameters.encodings needs ssrc or rid'));
-    }
-    if (encodings.length > 1) {
-      warn_once('simulcast',
-        'simulcast producer accepted (' + encodings.length + ' encodings) — one layer is forwarded until layer selection lands (M3).');
     }
     try { validateProducerRtpParameters(rp, router.rtpCapabilities); }
     catch (e) { return Promise.reject(UnsupportedError(e.message)); }
@@ -2219,7 +2421,23 @@ function WebRtcTransport(opts, cb) {
     // ONE NEGOTIATION AT A TIME (found by review): two produce() calls not
     // awaited interleaved their offers; one rejected, the other kept no codecs.
     return chained(function () {
-      var mediaMid = String(state.nextProduceMid++);
+      // The section's mid is the CLIENT's (rtpParameters.mid): it is what
+      // the client stamps in the MID header extension of every packet, and
+      // the receiving stack identifies a simulcast stream by MID + RID
+      // (RFC 8852). An internal counter (1, 2, 3, ... beside the bootstrap's
+      // 0) named sections differently from the wire: a screen share's
+      // packets carried the mid of our webcam section, both listing the
+      // same rids r0/r1/r2. Only when the client's mid is taken here (the
+      // bootstrap section's '0') or absent does the section get a mid of
+      // our own, in a namespace no client mid uses.
+      var _usedMids = { '0': true };
+      state.produceSections.forEach(function (sec) {
+        var mm = sec && /a=mid:(\S+)/.exec(sec);
+        if (mm) _usedMids[mm[1]] = true;
+      });
+      var mediaMid = (rp && rp.mid != null && !_usedMids[String(rp.mid)])
+        ? String(rp.mid)
+        : 'p' + (state.nextProduceMid++);
       var offer = synth_produce_offer(kind, rp, mediaMid, state.clientDtls,
                                       state.produceSections, state.reusableSections);
       var pc = state.pc;
@@ -2744,6 +2962,8 @@ function WebRtcTransport(opts, cb) {
     if (state.abortNegotiation) state.abortNegotiation();
     if (state.ownWebrtcRouter) { try { state.ownWebrtcRouter.close(); } catch (e) {} }
     if (state.ownSocket) { try { state.ownSocket.close(); } catch (e) {} }
+    if (state.tcpServer) { try { state.tcpServer.close(); } catch (e) {} }
+    if (state.heldTcp) { state.heldTcp.forEach(function (c) { try { c.destroy(); } catch (e) {} }); state.heldTcp = []; }
     state.iceState = 'closed'; state.dtlsState = 'closed';
     if (reason) ev.emit(reason);
     observer.emit('close');
@@ -2772,15 +2992,13 @@ function WebRtcServer(options, cb) {
   var ev = new EventEmitter();
   var observer = new EventEmitter();
 
-  var infos = (options && options.listenInfos) || [];
-  var udp = infos.filter(function (i) { return !i.protocol || i.protocol === 'udp'; })[0] || {};
-  var announced = [];
-  infos.forEach(function (i) {
-    if (i.announcedAddress) announced.push(i.announcedAddress);
-    else if (i.announcedIp) announced.push(i.announcedIp);
-    else if (i.ip && i.ip !== '0.0.0.0' && i.ip !== '::') announced.push(i.ip);
-  });
+  var udpInfos = udp_listen_infos(options && options.listenInfos);
+  var tcpInfos = tcp_listen_infos(options && options.listenInfos);
+  var udp = (udpInfos[0] && udpInfos[0].info) || {};
+  var announced = announced_of(udpInfos);
   if (!announced.length) announced = host_ipv4_addresses();
+  var tcpAnnounced = announced_of(tcpInfos);
+  if (!tcpAnnounced.length) tcpAnnounced = announced;
 
   var state = {
     id: uuid(), closed: false, port: udp.port || 0,
@@ -2801,6 +3019,8 @@ function WebRtcServer(options, cb) {
   });
 
   this._webrtcRouter = null;
+  this._tcpPort = null;                 // ICE-TCP listener, when a tcp entry asks
+  this._tcpAnnounced = tcpAnnounced;
 
   // webrtc-server's WebRTCRouter IS mediasoup's WebRtcServer, with more:
   // one socket, 5-tuple fast path, STUN USERNAME slow path for a new
@@ -2808,12 +3028,22 @@ function WebRtcServer(options, cb) {
   // plus RFC 9443 coexistence with TURN/QUIC on the same port, which
   // mediasoup does not offer.
   var wr = new WebRTCRouter({ announcedAddresses: state.announcedAddresses });
-  Promise.resolve(wr.listen(state.port || 0)).then(function () {
+  Promise.resolve(wr.listen({ port: state.port || 0, address: bind_ip_of(udpInfos) })).then(function () {
     state.webrtcRouter = wr;
     self._webrtcRouter = wr;
     if (!state.port && wr.address && wr.address()) state.port = wr.address().port;
     _diag('webRtcServer ' + state.id + ' listening on ' + state.port);
-    cb(null, self);
+    if (!tcpInfos.length) return cb(null, self);
+    var tinfo = tcpInfos[0];
+    listen_tcp_in_range('createWebRtcServer', range_of_info(tinfo.info, { min: 0, max: 0 }),
+                        tinfo.ip || '0.0.0.0', function (err, srv) {
+      if (err) return cb(err);
+      state.tcpServer = srv;
+      self._tcpPort = srv.address().port;
+      srv.on('connection', wr.tcp({ port: self._tcpPort }));
+      _diag('webRtcServer ' + state.id + ' ICE-TCP on ' + self._tcpPort);
+      cb(null, self);
+    });
   }).catch(function (err) { cb(err); });
 
   this.close = function () {
@@ -2821,13 +3051,14 @@ function WebRtcServer(options, cb) {
     state.closed = true;
     state.transports.slice().forEach(function (t) { try { t._routerClosed(); } catch (e) {} });
     try { wr.close(); } catch (e) {}
+    if (state.tcpServer) { try { state.tcpServer.close(); } catch (e) {} }
     observer.emit('close');
   };
 
   this.dump = function () {
     return _dumpOf(self, {
-      udpSockets: [{ ip: '0.0.0.0', port: state.port }],
-      tcpServers: [],
+      udpSockets: [{ ip: bind_ip_of(udpInfos), port: state.port }],
+      tcpServers: self._tcpPort ? [{ ip: (tcpInfos[0] && tcpInfos[0].ip) || '0.0.0.0', port: self._tcpPort }] : [],
       webRtcTransportIds: state.transports.map(function (t) { return t.id; }),
       localIceUsernameFragments: [],
       tupleHashes: [],
@@ -2977,6 +3208,9 @@ function Router(options, workerSettings) {
   safeEngineListener('producerpli', function (handle, info) {
     var p = producerForHandle(handle);
     if (p && p._trace) p._trace.fire('pli', 'out', info);
+    // A piped producer has no sender to PLI: the request goes back
+    // across the pipe to the original (see pipeToRouter).
+    if (p && p._onUpstreamPli) { try { p._onUpstreamPli(info || {}); } catch (e) {} }
   });
 
   state.sfuRouter.on('producerclose', function (handle) {
@@ -3044,7 +3278,7 @@ function Router(options, workerSettings) {
       }
       if (req != null && dc.subchannels.indexOf(req | 0) < 0) continue;
       if (ign != null && dc.subchannels.indexOf(ign | 0) >= 0) continue;
-      dc._forward(data);
+      dc._forward(data, opts);
     }
   };
   this.dump = function () {
@@ -3089,13 +3323,39 @@ function Router(options, workerSettings) {
   this.createWebRtcTransport = function (opts) {
     opts = opts || {};
     if (state.closed) return Promise.reject(InvalidStateError('Router closed'));
-    var udpInfo = (opts.listenInfos || []).filter(function (i) { return !i.protocol || i.protocol === 'udp'; })[0] || {};
+    var udpInfos = udp_listen_infos(opts.listenInfos || opts.listenIps);
+    var udpInfo = (udpInfos[0] && udpInfos[0].info) || {};
+    // Which protocols, as mediasoup decides: with a WebRtcServer both are on
+    // unless the app turns one off; with listenInfos each entry names its
+    // protocol; with legacy listenIps UDP is on and TCP opt-in.
+    var tcpInfos, enableUdp, enableTcp;
+    if (opts.webRtcServer) {
+      tcpInfos = [];
+      enableUdp = opts.enableUdp != null ? !!opts.enableUdp : true;
+      enableTcp = opts.enableTcp != null ? !!opts.enableTcp : true;
+    } else if (opts.listenInfos) {
+      tcpInfos = tcp_listen_infos(opts.listenInfos);
+      enableUdp = udpInfos.length > 0;
+      enableTcp = tcpInfos.length > 0;
+    } else {
+      enableUdp = opts.enableUdp != null ? !!opts.enableUdp : true;
+      enableTcp = opts.enableTcp != null ? !!opts.enableTcp : false;
+      tcpInfos = enableTcp ? udpInfos.map(function (u) { return { ip: u.ip, announced: u.announced, info: u.info }; }) : [];
+    }
+    if (!enableUdp && !enableTcp) {
+      return Promise.reject(new TypeError('createWebRtcTransport: at least one of enableUdp and enableTcp must be true'));
+    }
     return new Promise(function (resolve, reject) {
       var t = new WebRtcTransport({
         router: self,
         webRtcServer: opts.webRtcServer || null,
         portRange: port_range_of(udpInfo, opts.port),
-        announcedAddresses: announced_from(opts),
+        bindIp: bind_ip_of(udpInfos),
+        announcedAddresses: announced_of(udpInfos),
+        enableUdp: enableUdp, enableTcp: enableTcp, preferTcp: !!opts.preferTcp && !opts.preferUdp,
+        tcpBindIp: tcpInfos.length ? ((tcpInfos[0].ip) || '0.0.0.0') : null,
+        tcpPortRange: tcpInfos.length ? port_range_of(tcpInfos[0].info || {}, opts.port) : null,
+        tcpAnnounced: announced_of(tcpInfos),
         enableSctp: opts.enableSctp,
         numSctpStreams: opts.numSctpStreams,
         appData: opts.appData,
@@ -3128,18 +3388,6 @@ function Router(options, workerSettings) {
     if (info.portRange && info.portRange.min && info.portRange.max) return info.portRange;
     if (port) return { min: port, max: port };
     return { min: workerSettings.rtcMinPort || 10000, max: workerSettings.rtcMaxPort || 59999 };
-  }
-
-  function announced_from(opts) {
-    var out = [];
-    var infos = opts.listenInfos || opts.listenIps || [];
-    infos.forEach(function (i) {
-      if (typeof i === 'string') { if (i !== '0.0.0.0' && i !== '::') out.push(i); return; }
-      if (i.announcedAddress) out.push(i.announcedAddress);
-      else if (i.announcedIp) out.push(i.announcedIp);
-      else if (i.ip && i.ip !== '0.0.0.0' && i.ip !== '::') out.push(i.ip);
-    });
-    return out;
   }
 
   this.canConsume = function (opts) {
@@ -3196,13 +3444,18 @@ function Router(options, workerSettings) {
     if (target === self) {
       return Promise.reject(new TypeError('pipeToRouter: cannot pipe to self'));
     }
-    if (options.dataProducerId) {
-      return Promise.reject(UnsupportedError(
-        'pipeToRouter: SCTP piping (dataProducerId) is not implemented'));
+    if (options.producerId && options.dataProducerId) {
+      return Promise.reject(new TypeError('pipeToRouter: just producerId or dataProducerId can be given'));
     }
-    if (!options.producerId) {
-      return Promise.reject(new TypeError('pipeToRouter: producerId is required'));
+    if (!options.producerId && !options.dataProducerId) {
+      return Promise.reject(new TypeError('pipeToRouter: missing producerId or dataProducerId'));
     }
+    // mediasoup's keepId defaults to TRUE: the piped producer has the
+    // same id on the far router, and apps (the official demo included)
+    // consume it there by the original id. We defaulted to false, so
+    // such a consume found no producer.
+    var keepId = options.keepId !== false;
+    if (options.dataProducerId) return pipeDataToRouter(target, options, keepId);
     var producer = self._producerById(options.producerId);
     if (!producer) {
       return Promise.reject(NotFoundError('Producer not found: ' + options.producerId));
@@ -3222,7 +3475,7 @@ function Router(options, workerSettings) {
           // keepId lets an app address the piped producer by the same id
           // on both routers, which is what makes a room's producer list
           // meaningful across a split.
-          id:            options.keepId ? producer.id : undefined,
+          id:            keepId ? producer.id : undefined,
           kind:          producer.kind,
           rtpParameters: rp,
           paused:        producer.paused,
@@ -3239,11 +3492,64 @@ function Router(options, workerSettings) {
           // across the pipe.
           producer.observer.on('pause',  function () { pipeProducer.pause(); });
           producer.observer.on('resume', function () { pipeProducer.resume(); });
+          // KEYFRAMES CROSS THE PIPE. A viewer on the far router asks
+          // the pipe producer for a keyframe; that producer has no sender
+          // of its own, so the request goes back to the pipe consumer
+          // here, for the same layer. mediasoup does this with RTCP PLI
+          // over the pipe; both routers are in this process, so a call
+          // does it. Previously the request ended at the far side, and a
+          // viewer there waited for the browser's next unprompted
+          // keyframe (seconds, or never) — the 0 fps tiles with
+          // usePipeTransports.
+          var pipeSsrcs = (rp.encodings || []).map(function (e) { return e.ssrc >>> 0; });
+          pipeProducer._onUpstreamPli = function (info) {
+            var h = pipeConsumer._sfuHandle && pipeConsumer._sfuHandle();
+            if (!h || typeof h.requestKeyframe !== 'function') return;
+            var layer = pipeSsrcs.indexOf(info.ssrc >>> 0);
+            h.requestKeyframe(layer >= 0 && h._legs ? layer : undefined);
+          };
           return { pipeConsumer: pipeConsumer, pipeProducer: pipeProducer };
         });
       });
     });
   };
+
+  // pipeToRouter({dataProducerId}): same shape as mediasoup's — a
+  // DataConsumer on this side's pipe, a DataProducer (keepId: same id)
+  // on the far side's, and each one's close takes the other with it.
+  function pipeDataToRouter(target, options, keepId) {
+    var dataProducer = self._dataProducerById(options.dataProducerId);
+    if (!dataProducer) {
+      return Promise.reject(NotFoundError('DataProducer not found: ' + options.dataProducerId));
+    }
+    var pipeDataConsumer = null, pipeDataProducer = null;
+    return pipePairFor(target, options).then(function (pair) {
+      return pair.local._pipeConsumeData(dataProducer).then(function (dc) {
+        pipeDataConsumer = dc;
+        return pair.remote._pipeProduceData({
+          id:       keepId ? dataProducer.id : undefined,
+          sctpStreamParameters: dc.sctpStreamParameters,
+          label:    dc.label,
+          protocol: dc.protocol,
+          appData:  dataProducer.appData,
+        });
+      });
+    }).then(function (dp) {
+      pipeDataProducer = dp;
+      if (dataProducer.closed) throw NotFoundError('original DataProducer closed');
+      pipeDataConsumer._pipeSink = function (data, o) {
+        pipeDataProducer.send(data, undefined, o.subchannels,
+                              o.requiredSubchannel, o.ignoredSubchannel);
+      };
+      pipeDataConsumer.observer.on('close', function () { pipeDataProducer.close(); });
+      pipeDataProducer.observer.on('close', function () { pipeDataConsumer.close(); });
+      return { pipeDataConsumer: pipeDataConsumer, pipeDataProducer: pipeDataProducer };
+    }).catch(function (err) {
+      if (pipeDataConsumer) { try { pipeDataConsumer.close(); } catch (e) {} }
+      if (pipeDataProducer) { try { pipeDataProducer.close(); } catch (e) {} }
+      throw err;
+    });
+  }
 
   // One transport pair per destination router, created on first use.
   function pipePairFor(target, options) {
@@ -3254,7 +3560,9 @@ function Router(options, workerSettings) {
     var mk = function (router) {
       return router.createPipeTransport({
         listenInfo: listen,
-        enableSctp: false,          // SCTP piping is refused above
+        // Data is bridged in-process (see _pipeConsumeData), so the
+        // pipe itself carries only RTP.
+        enableSctp: false,
       });
     };
 
@@ -3274,6 +3582,36 @@ function Router(options, workerSettings) {
 
     state.pipePairs[key] = p;
     return p;
+  }
+
+  // The legs of a multi-encoding pipe consumer, driven as one engine
+  // handle: a pause or close is the consumer's, so it is every leg's. A
+  // pipe consumer ignores preferred layers, as mediasoup's does: the
+  // choosing happens on the far router.
+  function pipe_leg_composite(legs) {
+    var each = function (fn) {
+      legs.forEach(function (h) { try { fn(h); } catch (e) {} });
+    };
+    return {
+      id: legs[0].id, producerId: legs[0].producerId, peerId: legs[0].peerId,
+      _legs: legs,
+      pause:  function () { each(function (h) { h.pause(); }); },
+      resume: function () { each(function (h) { h.resume(); }); },
+      close:  function () { each(function (h) { h.close(); }); },
+      requestKeyframe: function (layer) {
+        if (layer != null && legs[layer]) { try { legs[layer].requestKeyframe(); } catch (e) {} return; }
+        each(function (h) { h.requestKeyframe(); });
+      },
+      getStats: function () {
+        var s = legs[0].getStats();
+        s.forwarded = legs.reduce(function (n, h) {
+          try { return n + (h.getStats().forwarded || 0); } catch (e) { return n; }
+        }, 0);
+        return s;
+      },
+      get currentSpatialLayer() { return null; },
+      get currentTemporalLayer() { return null; },
+    };
   }
 
   function createPlainLike(options, kindOfTransport) {
@@ -3297,6 +3635,7 @@ function Router(options, workerSettings) {
     var tstate = {
       id: uuid(), closed: false, appData: options.appData || {},
       consumers: [], producers: [], sctpState: 'new',
+      dataProducers: [], dataConsumers: [],
       remote: null, remoteRtcp: null,
       tuple: undefined, rtcpTuple: undefined,
       nextSsrc: (Math.random() * 0xfffffff) >>> 0,
@@ -3468,11 +3807,7 @@ function Router(options, workerSettings) {
           var payloadType = srcCodec.payloadType;
 
           var consumer = null, pendingHandle = null;
-          plainPeer.consume(sfuProducer, function (err, handle) {
-            if (err) { _diag('plain consume failed: ' + err.message); return; }
-            if (consumer && !consumer.closed) consumer._setSfuHandle(handle);
-            else pendingHandle = handle;
-          }, { ssrc: ssrc, pt: payloadType });
+          var srcEncodings = (producer.rtpParameters.encodings || []);
 
           var rtpParameters = getConsumerRtpParameters({
             producerRtpParameters: producer.rtpParameters,
@@ -3481,6 +3816,45 @@ function Router(options, workerSettings) {
             ssrc:                  ssrc,
             mid:                   undefined,
           });
+
+          if (kindOfTransport === 'pipe' && producer.kind === 'video' && srcEncodings.length > 1) {
+            /* A PIPE carries EVERY simulcast encoding, each on its own
+             * ssrc, as mediasoup's pipe consumer does, so the far router
+             * gets the full set and runs its own layer selection for its
+             * viewers. Previously the pipe was an ordinary consumer: it
+             * forwarded the single best layer, the far producer had one
+             * encoding, and a viewer on the far router could never be
+             * given a smaller layer (the demo's 320px request stayed at
+             * 1280).
+             * One engine consumer per encoding, each pinned to its layer. */
+            var legSsrcs = srcEncodings.map(function (e, k) {
+              return k === 0 ? ssrc : (tstate.nextSsrc = (tstate.nextSsrc + 1) >>> 0);
+            });
+            rtpParameters.encodings = srcEncodings.map(function (e, k) {
+              var enc = { ssrc: legSsrcs[k] };
+              if (e.maxBitrate != null) enc.maxBitrate = e.maxBitrate;
+              if (e.scalabilityMode) enc.scalabilityMode = e.scalabilityMode;
+              if (e.scaleResolutionDownBy != null) enc.scaleResolutionDownBy = e.scaleResolutionDownBy;
+              return enc;
+            });
+            var legs = new Array(legSsrcs.length), legsIn = 0;
+            legSsrcs.forEach(function (legSsrc, k) {
+              plainPeer.consume(sfuProducer, function (err, handle) {
+                if (err) { _diag('pipe consume leg ' + k + ' failed: ' + err.message); return; }
+                legs[k] = handle;
+                if (++legsIn !== legs.length) return;
+                var composite = pipe_leg_composite(legs);
+                if (consumer && !consumer.closed) consumer._setSfuHandle(composite);
+                else pendingHandle = composite;
+              }, { ssrc: legSsrc, pt: payloadType, pinLayer: k });
+            });
+          } else {
+            plainPeer.consume(sfuProducer, function (err, handle) {
+              if (err) { _diag('plain consume failed: ' + err.message); return; }
+              if (consumer && !consumer.closed) consumer._setSfuHandle(handle);
+              else pendingHandle = handle;
+            }, { ssrc: ssrc, pt: payloadType });
+          }
 
           consumer = new Consumer({
             id: uuid(), producerId: producer.id, kind: producer.kind,
@@ -3532,20 +3906,34 @@ function Router(options, workerSettings) {
             return Promise.reject(new TypeError(
               'produce: ssrc must be an unsigned 32-bit integer, got ' + enc.ssrc));
           }
-          if ((rp.encodings || []).length > 1) {
+          // Several encodings, each with its own ssrc (a pipe from
+          // another router carrying every simulcast layer, or a sender
+          // that declares them): all are ingested as one producer's
+          // layers, low→high in the order given. Encodings without an
+          // ssrc cannot be matched to packets, so only the first is
+          // taken then, as before.
+          var encs = rp.encodings || [];
+          var allSsrcs = encs.length > 1 && encs.every(function (e) {
+            return Number.isInteger(e.ssrc) && e.ssrc >= 0 && e.ssrc <= 0xffffffff;
+          });
+          if (encs.length > 1 && !allSsrcs) {
             warn_once('plainSimulcast',
               'PlainTransport.produce(): only the first encoding is ingested — ' +
-              'simulcast over plain RTP is not supported.');
+              'the others declare no ssrc.');
           }
           var codec = (rp.codecs || [])[0] || {};
           var codecName = String(codec.mimeType || '').split('/')[1] || '';
           var ssrc = enc.ssrc >>> 0;
+          var ssrcSet = {};
+          if (allSsrcs) encs.forEach(function (e) { ssrcSet[e.ssrc >>> 0] = true; });
+          else ssrcSet[ssrc] = true;
 
           var engineHandle;
           try {
             engineHandle = state.sfuRouter.addPlainProducer({
               peerHandle: plainPeer, kind: opts2.kind,
               ssrc: ssrc, codecName: codecName,
+              ssrcs: allSsrcs ? encs.map(function (e) { return e.ssrc >>> 0; }) : undefined,
             });
           } catch (e) { return Promise.reject(e); }
 
@@ -3557,8 +3945,9 @@ function Router(options, workerSettings) {
             if (((msg[0] & 0xc0) >> 6) !== 2) return;             // not RTP version 2
             var pt = msg[1] & 0x7f;
             if (pt >= 72 && pt <= 76) return;                      // RTCP, not media
-            if (msg.readUInt32BE(8) >>> 0 !== ssrc) return;        // another producer's stream
-            engineHandle.push(msg, { ssrc: ssrc, payloadType: pt,
+            var inSsrc = msg.readUInt32BE(8) >>> 0;
+            if (!ssrcSet[inSsrc]) return;                          // another producer's stream
+            engineHandle.push(msg, { ssrc: inSsrc, payloadType: pt,
                                      sequenceNumber: msg.readUInt16BE(2) });
           };
           socket.on('message', onPacket);
@@ -3586,6 +3975,54 @@ function Router(options, workerSettings) {
           return Promise.reject(UnsupportedError(kindOfTransport + 'Transport: SCTP is not implemented'));
         },
 
+        /* Data half of pipeToRouter. Every router in this shim lives in
+         * the same process, so the far router's DataProducer can be fed
+         * directly by this side's DataConsumer, with no SCTP association
+         * over the pipe. The public produceData/consumeData above still
+         * refuse: an app that pairs a PipeTransport with a REAL remote
+         * mediasoup would need wire SCTP, and we don't have it.
+         * Previously pipeToRouter({dataProducerId}) rejected outright, and
+         * the official demo with usePipeTransports=true lost the whole
+         * join over it (its bot pipes a DataProducer on room creation). */
+        _pipeConsumeData: function (src) {
+          if (tstate.closed) return Promise.reject(InvalidStateError('transport closed'));
+          var dc = new DataConsumer({
+            id: uuid(), dataProducerId: src.id, label: src.label, protocol: src.protocol,
+            sctpStreamParameters: src.sctpStreamParameters,
+            transport: pt, channel: null, appData: {},
+          });
+          tstate.dataConsumers.push(dc);
+          self._registerDataConsumer(dc);
+          tobs.emit('newdataconsumer', dc);
+          return Promise.resolve(dc);
+        },
+        _pipeProduceData: function (opts2) {
+          if (tstate.closed) return Promise.reject(InvalidStateError('transport closed'));
+          if (opts2.id && self._dataProducerById(opts2.id)) {
+            return Promise.reject(new Error('a DataProducer with same id already exists'));
+          }
+          var dp = new DataProducer({
+            id: opts2.id || uuid(), label: opts2.label, protocol: opts2.protocol,
+            sctpStreamParameters: opts2.sctpStreamParameters,
+            transport: pt, channel: null, appData: opts2.appData,
+          });
+          tstate.dataProducers.push(dp);
+          self._registerDataProducer(dp);
+          tobs.emit('newdataproducer', dp);
+          return Promise.resolve(dp);
+        },
+        _onDataProducerClosed: function (dp) {
+          var i = tstate.dataProducers.indexOf(dp);
+          if (i >= 0) tstate.dataProducers.splice(i, 1);
+          self._forEachDataConsumerOf(dp.id, function (dc2) { dc2._dataProducerClosed(); });
+          self._unregisterDataProducer(dp);
+        },
+        _onDataConsumerClosed: function (dc2) {
+          var i = tstate.dataConsumers.indexOf(dc2);
+          if (i >= 0) tstate.dataConsumers.splice(i, 1);
+          self._unregisterDataConsumer(dc2);
+        },
+
         getStats: function () {
           return Promise.resolve([{
             type: kindOfTransport + '-transport', transportId: tstate.id,
@@ -3600,7 +4037,8 @@ function Router(options, workerSettings) {
             direct: false, tuple: tstate.tuple, rtcpTuple: tstate.rtcpTuple,
             consumerIds: tstate.consumers.map(function (c) { return c.id; }),
             producerIds: tstate.producers.map(function (p) { return p.id; }),
-            dataProducerIds: [], dataConsumerIds: [],
+            dataProducerIds: tstate.dataProducers.map(function (d) { return d.id; }),
+            dataConsumerIds: tstate.dataConsumers.map(function (d) { return d.id; }),
           });
         },
         close: function () {
@@ -3614,6 +4052,13 @@ function Router(options, workerSettings) {
             self._forEachConsumerOf(pr.id, function (c2) { c2._producerClosed(); });
             self._unregisterProducer(pr);
             try { pr._transportClosed(); } catch (e) {}
+          });
+          tstate.dataProducers.slice().forEach(function (dp) {
+            self._forEachDataConsumerOf(dp.id, function (dc2) { dc2._dataProducerClosed(); });
+            self._unregisterDataProducer(dp); dp._transportClosed();
+          });
+          tstate.dataConsumers.slice().forEach(function (dc2) {
+            self._unregisterDataConsumer(dc2); dc2._transportClosed();
           });
           try { plainPeer.close(); } catch (e) {}
           try { socket.close(); } catch (e) {}

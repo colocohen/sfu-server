@@ -41,6 +41,7 @@ var CONSUME_TIMEOUT_MS  = 15000;
 var PLI_MIN_INTERVAL_MS = 500;
 
 var _ids = { peer: 0, producer: 0, consumer: 0 };
+var _svcDesc = {};   // reused per packet by the SVC path (VP9 descriptor)
 
 // Lifecycle diagnostics — the three blind runs of M1 taught us the router
 // must narrate itself. On when SFU_DEBUG or WEBRTC_DEBUG is set.
@@ -585,6 +586,22 @@ function Router(options) {
   // primary packets (see the M3a note at the top).
   function producer_layers(p) {
     var out = [];
+    if (p.plain && p.ssrcs && p.ssrcs.length > 1) {
+      // A plain producer that declared several encodings (a pipe from
+      // another router carrying every simulcast layer): its layers are
+      // the declared ssrcs, already ordered low→high as the encodings
+      // list them, so no ranking is needed.
+      var stM = p.peer._src_stats || {}, nowM = Date.now();
+      for (var pi = 0; pi < p.ssrcs.length; pi++) {
+        var om = stM[p.ssrcs[pi]];
+        out.push({
+          ssrc:  p.ssrcs[pi], rid: null, rank: pi,
+          rate:  om ? (om.rate || om.win_bytes) : 0,
+          fresh: !!(om && nowM - om.last_at < LAYER_STALE_MS),
+        });
+      }
+      return out;
+    }
     if (p.plain) {
       var st0 = (p.peer._src_stats || {})[p.ssrc];
       return [{
@@ -630,6 +647,13 @@ function Router(options) {
   //     dropping is immediate, because a stalled layer is a frozen viewer
   function choose_layer(c, layers, budget) {
     if (!layers.length) return null;
+    // PINNED (a pipe consumer's per-layer leg): this consumer carries one
+    // specific encoding and nothing else. The far router does its own
+    // layer selection over the full set, so "the best fresh layer" here
+    // would put the wrong picture under an ssrc the far side believes is
+    // a particular resolution. Until that layer has been seen, there is
+    // nothing to pick.
+    if (c.pin_layer != null) return layers[c.pin_layer] || null;
     var maxIdx = (c.preferred_spatial == null) ? layers.length - 1
                                                : Math.min(c.preferred_spatial, layers.length - 1);
 
@@ -757,6 +781,16 @@ function Router(options) {
     if (!t) return false;
     if (t.stopped === true || t.direction === 'stopped') return true;
     var cd = t.currentDirection;
+    // A producer on a re-used consumer transceiver (track handler) is born
+    // before the negotiation that makes it receive: until then
+    // currentDirection is the old 'sendonly'. Wait for that negotiation;
+    // if it ends without receiving (rollback, peer answered otherwise),
+    // it is over like any other.
+    if (p.awaiting_recv) {
+      if (cd === 'sendrecv' || cd === 'recvonly') p.awaiting_recv = false;
+      else if (p.peer.pc && p.peer.pc.signalingState !== 'stable') return false;
+      else p.awaiting_recv = false;
+    }
     return cd === 'stopped' || cd === 'inactive' || cd === 'sendonly';
   }
 
@@ -776,6 +810,8 @@ function Router(options) {
 
   function spatial_index_of(c) {
     if (!c.producer || c.producer.kind !== 'video' || c.src_ssrc == null) return null;
+    // SVC: one ssrc, so the layer is the SID ceiling actually applied.
+    if (c.svc_current != null) return c.svc_current;
     var lys = producer_layers(c.producer);
     for (var i = 0; i < lys.length; i++) if (lys[i].ssrc === c.src_ssrc) return i;
     return null;
@@ -885,6 +921,98 @@ function Router(options) {
    *      schedules a cascade run (the _has_unbound guard keeps this
    *      off the steady-state path).
    */
+  /* ── VP9 SVC spatial layers ───────────────────────────────────
+   * The producer's live spatial layers are the SIDs seen recently (a
+   * browser sheds its top layers when its bandwidth drops, and the
+   * ceiling must follow, or a viewer would wait on a layer that stopped).
+   */
+  // Each spatial layer's own byte rate too (1 s windows, smoothed): a
+  // viewer's bandwidth ceiling is compared with the CUMULATIVE rate of
+  // layers 0..k, since layer k is useless without the ones below it.
+  function note_svc_layer(p, sid, now, bytes) {
+    if (!p.svc_seen) { p.svc_seen = []; p.svc_win = []; p.svc_rate = []; p.svc_win_at = now; }
+    p.svc_seen[sid] = now;
+    p.svc_win[sid] = (p.svc_win[sid] || 0) + (bytes || 0);
+    var dt = now - p.svc_win_at;
+    if (dt >= 1000) {
+      for (var i = 0; i < p.svc_win.length; i++) {
+        var r = (p.svc_win[i] || 0) * 1000 / dt;
+        p.svc_rate[i] = p.svc_rate[i] == null ? r : 0.5 * p.svc_rate[i] + 0.5 * r;
+        p.svc_win[i] = 0;
+      }
+      p.svc_win_at = now;
+    }
+  }
+  // Highest layer <= want whose cumulative rate the viewer's estimate
+  // affords; the same headroom/climb margins as simulcast's choose_layer
+  // (an unmeasured layer counts as affordable).
+  function svc_affordable(c, want, cur) {
+    var budget = consumer_budget_bps(c);
+    var rates = c.producer.svc_rate;
+    if (budget == null || !rates) return want;
+    var sum = 0, afford = 0;
+    for (var k = 0; k <= want; k++) {
+      sum += rates[k] || 0;
+      if (!rates[k]) { afford = k; continue; }
+      var factor = (cur != null && k > cur) ? BWE_CLIMB_MARGIN : BWE_HEADROOM;
+      if (budget >= sum * factor) afford = k; else break;
+    }
+    return afford;
+  }
+  function svc_top_layer(p, now) {
+    var top = -1, seen = p.svc_seen || [];
+    for (var i = 0; i < seen.length; i++) {
+      if (seen[i] && now - seen[i] < LAYER_STALE_MS) top = i;
+    }
+    return top;
+  }
+
+  // Is this packet's spatial layer one this consumer forwards? Moves the
+  // consumer's current layer at the only points a decoder can follow:
+  //   down — at the start of a picture (the lower layers it keeps were
+  //          decodable all along; it just stops getting the ones above);
+  //   up   — at a keyframe picture only. A higher layer refers to its own
+  //          earlier frames (and in K-SVC to nothing below outside
+  //          keyframes), which this viewer never got; so ask for one.
+  function svc_select(c, d, now, repair) {
+    var p = c.producer;
+    var top = svc_top_layer(p, now);
+    if (top < 0) return true;
+    var want = (c.preferred_spatial == null) ? top : Math.min(c.preferred_spatial, top);
+    // BANDWIDTH CEILING on top of the app's, as for simulcast: a viewer
+    // whose estimate cannot carry the full set is given fewer layers
+    // instead of a congested stream. Climbing back waits for the
+    // estimate to hold for LAYER_UP_HOLD_MS, so it cannot ping-pong.
+    // Only a climb out of a BANDWIDTH cap waits; a layer that just
+    // appeared (the producer's first keyframe brings them one by one) or
+    // an app raising its ceiling is taken at the next keyframe.
+    var capped = svc_affordable(c, want, c.svc_current);
+    if (capped < want) c.svc_bwe_capped_at = now;
+    want = capped;
+    if (c.svc_current != null && want > c.svc_current &&
+        c.svc_bwe_capped_at && now - c.svc_bwe_capped_at < LAYER_UP_HOLD_MS) {
+      want = c.svc_current;
+    }
+    var pictureStart = d.start && d.sid === 0;
+    if (!repair && pictureStart) {
+      var cur = c.svc_current;
+      var keyPicture = !d.inter;
+      if (cur == null || want < cur || (want > cur && keyPicture)) {
+        if (cur !== want) {
+          c.svc_current = want;
+          _diag(c.id + ' SVC spatial layer ' + (cur == null ? '-' : cur) + ' → ' + want);
+          try { ev.emit('consumerlayerschange', c.handle, { ssrc: c.src_ssrc, spatial: want }); }
+          catch (e) { _diag('consumerlayerschange listener threw: ' + (e && e.message)); }
+        }
+      } else if (want > cur && now - c.last_pli_at > PLI_MIN_INTERVAL_MS) {
+        c.last_pli_at = now;
+        request_keyframe(p, c.src_ssrc);
+      }
+    }
+    if (c.svc_current == null) return true;   // nothing chosen yet: as received
+    return d.sid <= c.svc_current;
+  }
+
   function attach_peer_tap(peer) {
     peer._tap = function (rtp, rinfo, info) {
       try { tap_inner(rtp, rinfo, info); }
@@ -1062,6 +1190,22 @@ function Router(options) {
         if (ac.preferred_temporal != null) anyCap = true;
         if (needKf && anyCap) break;
       }
+      // VP9 SVC: every spatial layer rides ONE ssrc, told apart by the
+      // SID in the payload descriptor. Parsed for every VP9 packet (one
+      // walk over a few bytes) because the producer's live layers must
+      // be known before any consumer asks for fewer of them.
+      var svcP = list[0].producer;
+      var svc = null;
+      if (svcP.kind === 'video' && producer_codec_name(svcP).toUpperCase() === 'VP9') {
+        var ps9 = payloadOffset(rtp);
+        if (ps9 >= 0 && ps9 < rtp.length) {
+          VP9Depacketizer.peekDescriptor(rtp.subarray(ps9), _svcDesc);
+          if (_svcDesc.ok && _svcDesc.sid != null) {
+            svc = _svcDesc;
+            note_svc_layer(svcP, svc.sid, nowP, rtp.length);
+          }
+        }
+      }
       // The codec name is needed only if we are going to parse.
       var codecName = (_DBG_KF || needKf || anyCap)
                       ? producer_codec_name(list[0].producer) : '';
@@ -1113,8 +1257,31 @@ function Router(options) {
         // temporal information (tid === null) always pass — a stream
         // without temporal structure must not go dark because an app
         // asked for a low temporal layer.
+        // Dropped packets are reported to the forwarder, so the viewer's
+        // sequence numbers close up over them. Before, a filtered packet
+        // left a gap, the viewer NACKed a packet that would never come,
+        // and counted it as loss.
         if (c.preferred_temporal != null && tid != null && tid > c.preferred_temporal) {
+          if (c.fwd && !repair) c.fwd.drop(rtp);
           continue;
+        }
+
+        // SPATIAL FILTERING (VP9 SVC). A viewer whose ceiling is below the
+        // producer's top spatial layer gets only the layers up to it.
+        // Before, SVC passed through whole: the app's setPreferredLayers
+        // changed nothing on the wire while currentLayers reported the
+        // layer it asked for.
+        var setMarker = false;
+        if (svc) {
+          if (!svc_select(c, svc, nowP, repair)) {
+            if (c.fwd && !repair) c.fwd.drop(rtp);
+            continue;
+          }
+          // The RTP marker ends a PICTURE, and the encoder put it on the
+          // top layer's last packet. With the top dropped, the end of the
+          // highest layer we DO send must carry it, or the receiver waits
+          // for the rest of a picture that is never coming.
+          setMarker = (svc.sid === c.svc_current && svc.end);
         }
         if (tid != null && tid !== c.current_temporal) {
           c.current_temporal = tid;
@@ -1138,6 +1305,7 @@ function Router(options) {
         }
 
         var out = c.fwd.forward(rtp);
+        if (out && setMarker) out[1] |= 0x80;
         if (out) {
           c.last_fwd_at = nowP;
           try { c.peer.manager.sendRtp(out); } catch (e) {}
@@ -1238,13 +1406,15 @@ function Router(options) {
 
   /* ── Records ─────────────────────────────────────────────────── */
 
-  function add_producer(peer, track, transceiver) {
+  function add_producer(peer, track, transceiver, flags) {
     var p = {
       id: 'producer-' + (++_ids.producer),
       peer: peer, kind: track.kind, track: track,
       transceiver: transceiver || null,
       mid: transceiver ? transceiver.mid : null,
       ssrc: null, closed: false, handle: null,
+      shared: !!(flags && flags.shared),                // see the track handler
+      awaiting_recv: !!(flags && flags.awaiting_recv),
     };
     p.handle = {
       id: p.id, kind: p.kind, peerId: peer.id,
@@ -1296,14 +1466,21 @@ function Router(options) {
       if (state.peers[i].handle === opts.peerHandle) { peer = state.peers[i]; break; }
     }
     if (!peer) throw new Error('addPlainProducer: unknown peer');
-    if (opts.ssrc == null) throw new TypeError('addPlainProducer: ssrc is required');
+    if (opts.ssrc == null && !(opts.ssrcs && opts.ssrcs.length)) {
+      throw new TypeError('addPlainProducer: ssrc is required');
+    }
+    // ssrcs: several encodings, low→high (simulcast arriving over a
+    // pipe). The first stands in as the producer's reference ssrc.
+    var ssrcList = (opts.ssrcs && opts.ssrcs.length)
+      ? opts.ssrcs.map(function (x) { return x >>> 0; }) : null;
 
     var p = {
       id: 'producer-' + (++_ids.producer),
       peer: peer, kind: opts.kind || 'video', track: null,
       transceiver: null, mid: null, plain: true,
       codecName: opts.codecName || null,
-      ssrc: opts.ssrc >>> 0, closed: false, handle: null,
+      ssrc: ssrcList ? ssrcList[0] : (opts.ssrc >>> 0),
+      ssrcs: ssrcList, closed: false, handle: null,
     };
     p.handle = {
       id: p.id, kind: p.kind, peerId: peer.id,
@@ -1319,7 +1496,7 @@ function Router(options) {
       },
     };
     state.producers.push(p);
-    _diag(p.id + ' plain producer: ssrc=' + p.ssrc + ' kind=' + p.kind);
+    _diag(p.id + ' plain producer: ssrc=' + (ssrcList ? ssrcList.join(',') : p.ssrc) + ' kind=' + p.kind);
     emit_safely('producer', p.handle, peer.handle);
     run_cascades();
     return p.handle;
@@ -1328,6 +1505,21 @@ function Router(options) {
   function close_producer(p) {
     if (p.closed) return;
     p.closed = true;
+    // A shared transceiver (track handler) whose consumer still sends:
+    // back to sendonly, as the consumer made it — left at sendrecv it
+    // would ask for a negotiation of its own and offer the peer to send
+    // there again.
+    if (p.shared && p.transceiver && is_consumer_transceiver(p.peer, p.transceiver) &&
+        p.transceiver.direction === 'sendrecv' &&
+        p.peer.pc && p.peer.pc.signalingState !== 'closed') {
+      try { p.transceiver.direction = 'sendonly'; } catch (e) {}
+    } else if (p.shared && p.transceiver && !p.transceiver.stopped &&
+               p.peer.pc && p.peer.pc.signalingState !== 'closed') {
+      // ...and one whose consumer already left (close_consumer kept it
+      // only for this producer): nobody uses it now — retire the m-line,
+      // as close_consumer does for an ordinary consumer transceiver.
+      try { p.transceiver.stop(); } catch (e) {}
+    }
     for (var i = state.consumers.length - 1; i >= 0; i--) {
       if (state.consumers[i].producer === p) close_consumer(state.consumers[i]);
     }
@@ -1355,8 +1547,17 @@ function Router(options) {
     if (c.transceiver && !c.peer.plain && !c.peer.closed &&
         c.peer.pc && c.peer.pc.signalingState !== 'closed') {
       unregister_outbound(c);
-      try { c.transceiver.stop(); }
-      catch (e) { _diag(c.id + ' transceiver.stop() failed: ' + (e && e.message)); }
+      if (producer_on_transceiver(c.peer, c.transceiver)) {
+        // The peer sends its own media on this transceiver too (shared, see
+        // the track handler): stop() would end that producer for every
+        // viewer. Only our sending half goes; the peer's receiver for the
+        // departed producer is muted by that negotiation.
+        try { c.transceiver.direction = 'recvonly'; }
+        catch (e) { _diag(c.id + ' direction recvonly failed: ' + (e && e.message)); }
+      } else {
+        try { c.transceiver.stop(); }
+        catch (e) { _diag(c.id + ' transceiver.stop() failed: ' + (e && e.message)); }
+      }
     }
 
     // A consume still waiting on its callback is owed an answer: the
@@ -1440,6 +1641,12 @@ function Router(options) {
         requestKeyframe: function () {},          // no upstream from a sink
         registerOutboundStream: function () {},
         ev: new EventEmitter(),
+        // Optional: what this sink can take, in bits/s, when the caller
+        // knows it. Layer selection reads it the way it reads a browser
+        // peer's bandwidth estimate; without it a plain sink has no
+        // ceiling, as before.
+        getEstimatedBandwidth: typeof opts.getEstimatedBandwidth === 'function'
+          ? function () { return opts.getEstimatedBandwidth(); } : undefined,
       },
       _src_stats: {},
     };
@@ -1575,12 +1782,37 @@ function Router(options) {
       // sendrecv. Our transceiver stays sendonly, so the answer tells the
       // peer not to send there, and the "producer" this used to create
       // never got an ssrc: every consume of it timed out (producerSsrc=null).
+      //
+      // But the peer DOES mean to send: that is a real producer (a camera
+      // turned back on after removeTrack — Chrome reuses the transceiver
+      // that shows it someone else). Answering sendonly, as this used to,
+      // left it never sending: the re-added video reached no viewer and no
+      // producer was ever created. So the transceiver becomes sendrecv —
+      // the consumer keeps sending on it, the peer's track rides the
+      // receive half — set here, during setRemoteDescription(offer), so the
+      // answer created next already says sendrecv.
+      var shared = false;
       if (is_consumer_transceiver(peer, event.transceiver)) {
-        _diag(peer.id + ' track event on our own consumer transceiver (mid=' +
-              (event.transceiver && event.transceiver.mid) + ') — not a producer');
-        return;
+        var tq = event.transceiver;
+        if (tq.direction !== 'sendonly' && tq.direction !== 'sendrecv') {
+          _diag(peer.id + ' track event on consumer transceiver mid=' + tq.mid +
+                ' (direction ' + tq.direction + ') — not a producer');
+          return;
+        }
+        _diag(peer.id + ' peer sends on our consumer transceiver (mid=' + tq.mid +
+              ') — sendrecv, new producer on its receive half');
+        if (tq.direction === 'sendonly') {
+          try { tq.direction = 'sendrecv'; }
+          catch (e) { _diag('direction sendrecv failed: ' + (e && e.message)); return; }
+        }
+        shared = true;
       }
-      add_producer(peer, event.track, event.transceiver);
+      // Its currentDirection still reads the last round's 'sendonly' until
+      // this negotiation completes; cascade P must not take that as
+      // "stopped receiving" (see producer_stopped_receiving). Flagged at
+      // creation: the 'producer' event add_producer emits already runs the
+      // cascades (the Room consumes it at once).
+      add_producer(peer, event.track, event.transceiver, shared ? { shared: true, awaiting_recv: true } : null);
       run_cascades();
     };
     pc.addEventListener('track', peer._listeners.track);
@@ -1657,6 +1889,15 @@ function Router(options) {
     if (pc.signalingState === 'closed') close_peer(peer);
   }
 
+  function producer_on_transceiver(peer, t) {
+    if (!t) return null;
+    for (var i = 0; i < state.producers.length; i++) {
+      var p = state.producers[i];
+      if (p.peer === peer && !p.closed && p.transceiver === t) return p;
+    }
+    return null;
+  }
+
   function is_consumer_transceiver(peer, t) {
     if (!t) return false;
     for (var i = 0; i < state.consumers.length; i++) {
@@ -1693,6 +1934,7 @@ function Router(options) {
       // known before any cascade runs.
       ssrc: (plainOpts && plainOpts.ssrc != null) ? (plainOpts.ssrc >>> 0) : null,
       pt:   (plainOpts && plainOpts.pt   != null) ? plainOpts.pt : null,
+      pin_layer: (plainOpts && plainOpts.pinLayer != null) ? (plainOpts.pinLayer | 0) : null,
       fwd: null, bound: false, paused: false,
       src_ssrc: null,          // the LAYER this consumer forwards (M3a)
       target_ssrc: null,       // layer it is switching to, once a keyframe of it arrives
@@ -1737,6 +1979,12 @@ function Router(options) {
         run_cascades();
       },
       get currentSpatialLayer() { return spatial_index_of(c); },
+      // A keyframe of the layer THIS consumer forwards — what a pipe leg
+      // needs when the far router's viewer asks for a decode point.
+      requestKeyframe: function () {
+        if (c.closed) return;
+        request_keyframe(p, c.src_ssrc != null ? c.src_ssrc : p.ssrc);
+      },
       // M3c. Unlike the spatial ceiling this needs no cascade pass and no
       // keyframe: temporal selection is a per-packet decision the very
       // next packet already honours, and every TID at or below the new
