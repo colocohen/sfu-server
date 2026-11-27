@@ -19,6 +19,7 @@
 //                        direction }]
 
 import { SDP } from 'webrtc-server';
+import { DEPENDENCY_DESCRIPTOR_URI } from 'rtp-packet';
 
 /* ── feedback string → mediasoup {type, parameter} ── */
 function fb(entry) {
@@ -135,6 +136,21 @@ function buildHeaderExtensions() {
       });
     }
   }
+  // The Dependency Descriptor (AV1 RTP spec, Appendix A): RECEIVED from
+  // producers, which the router reads for layer selection (sfu.js
+  // dd_select), and not sent to consumers, as mediasoup has it
+  // (supportedRtpCapabilities: direction 'recvonly'). A consumer is sent
+  // the layers it gets; forwarding the producer's descriptor would also
+  // mean rewriting its active decode targets for each one (A.4: "Whenever
+  // the set of active Decode targets changes, the sender MUST signal the
+  // new set"). The id follows SDP.DEFAULT_VIDEO_EXTENSIONS' last one.
+  out.push({
+    kind:             'video',
+    uri:              DEPENDENCY_DESCRIPTOR_URI,
+    preferredId:      13,
+    preferredEncrypt: false,
+    direction:        'recvonly',
+  });
   return out;
 }
 

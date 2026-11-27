@@ -35,6 +35,7 @@ import {
   RtpForwarder, payloadOffset, readExtension,
   VP8Depacketizer, VP9Depacketizer,
   H264Depacketizer, H265Depacketizer, AV1Depacketizer,
+  DEPENDENCY_DESCRIPTOR_URI, DTI, parseDependencyDescriptor, decodeTargetFor,
 } from 'rtp-packet';
 
 var CONSUME_TIMEOUT_MS  = 15000;
@@ -167,11 +168,46 @@ function is_keyframe(rtp, codecName) {
   // simply failed to identify — a guess that can report a keyframe that
   // never happened. Unknown means unknown; KF_MAX_RETRIES covers the
   // consequence.
-  var peek = codecName ? KEYFRAME_PEEK[String(codecName).toUpperCase()] : null;
+  var name = codecName ? String(codecName).toUpperCase() : '';
+  var peek = name ? KEYFRAME_PEEK[name] : null;
   if (!peek) return false;
   var ps = payloadOffset(rtp);
   if (ps < 0 || ps >= rtp.length) return false;
-  return !!peek(rtp.subarray(ps));
+  var payload = rtp.subarray(ps);
+  if (name === 'H264' && h264_carries_sps(payload)) return true;
+  return !!peek(payload);
+}
+
+// H.264: the entry point is where the IDR access unit BEGINS, and that is
+// its sequence parameter set when the sender carries the parameter sets
+// in band. Chrome sends each IDR as STAP-A [SPS, PPS] (RFC 6184 §5.7.1)
+// followed by the IDR slice's FU-A fragments, in packets of their own.
+// Switching layers on the IDR slice alone (peekKeyframe's answer, NAL
+// type 5) started a viewer one packet too late: the new layer's SPS and
+// PPS stayed behind, its decoder kept the old layer's, and the IDR was
+// read against the wrong picture size (a 1280-wide layer shown at 640,
+// layer 0 at 1280). mediasoup takes the SPS as the keyframe start the
+// same way (RTC/RTP/Codecs/H264.cpp). A stream whose parameter sets are
+// signalled out of band (sprop-parameter-sets) has no SPS in band, and
+// the IDR slice still counts.
+function h264_carries_sps(p) {
+  if (!p || p.length < 1) return false;
+  var t = p[0] & 0x1F;
+  if (t === 7) return true;                         // single NAL unit
+  if (t === 24) {                                   // STAP-A: walk its NAL units
+    var off = 1;
+    while (off + 2 < p.length) {
+      var size = p.readUInt16BE(off);
+      off += 2;
+      if (size === 0) continue;
+      if (off + size > p.length) return false;      // truncated
+      if ((p[off] & 0x1F) === 7) return true;
+      off += size;
+    }
+    return false;
+  }
+  if (t === 28) return p.length >= 2 && (p[1] & 0x80) !== 0 && (p[1] & 0x1F) === 7;   // FU-A start
+  return false;
 }
 
 // Which temporal layer is this packet in? null means the stream carries
@@ -316,8 +352,16 @@ function Router(options) {
       //    stable means we only ever ADD to a settled session, so our
       //    renegotiation is the only offer in flight. (Same reason
       //    mediasoup consumes only on connected transports.)
+      //    A peer added with { offerer: true } is always the offerer of
+      //    its first negotiation and is sent no remote offer before that
+      //    offer is answered (the mediasoup compat transport: its answer
+      //    comes with the client's DTLS parameters, at connect). No glare
+      //    is possible, so a consumer's m-line may join that first offer
+      //    while it waits: a re-offer in have-local-offer (RFC 9429 5.2.2).
       if (c.transceiver == null && !c.peer.plain && c.peer.attached && !c.peer.closed &&
-          c.peer.pc.remoteDescription && c.peer.pc.signalingState === 'stable') {
+          ((c.peer.pc.remoteDescription && c.peer.pc.signalingState === 'stable') ||
+           (c.peer.offerer && !c.peer.pc.remoteDescription &&
+            c.peer.pc.signalingState === 'have-local-offer'))) {
         try {
           // streamIds: group this consumer's track under its SOURCE
           // PARTICIPANT's stream — the viewer gets one MediaStream per
@@ -1013,6 +1057,43 @@ function Router(options) {
     return d.sid <= c.svc_current;
   }
 
+  // Is this frame in the decode target this consumer gets (A.4, A.7)?
+  // The target is the one at the consumer's spatial layer (svc_select's,
+  // else the top) and temporal ceiling; a frame is forwarded when its
+  // Decode Target Indication for it is not 'not present' (Table A.1).
+  // The temporal ceiling in effect (dd_temporal) moves
+  //   down — at the start of a frame (the lower decode target's frames
+  //          were all forwarded, so it stays decodable);
+  //   up   — at a frame whose indication for the higher target is
+  //          'switch' (A.7: "An SFM MAY begin forwarding packets belonging
+  //          to a new Decode target beginning with a decodable frame
+  //          containing a Switch indication"), or a new structure (a
+  //          keyframe). Before that, the frames of the higher target refer
+  //          to frames this viewer never got.
+  // A repair is judged against the ceiling in effect and moves nothing.
+  function dd_select(c, dd, ddS, svc, repair) {
+    var st = ddS.structure;
+    var f = dd.frame;
+    var maxS = (svc && c.svc_current != null) ? c.svc_current : st.maxSpatialId;
+    var want = (c.preferred_temporal == null) ? st.maxTemporalId : Math.min(c.preferred_temporal, st.maxTemporalId);
+    if (!repair && dd.startOfFrame) {
+      var cur = c.dd_temporal;
+      if (cur == null || dd.structure || want < cur) {
+        c.dd_temporal = want;
+      } else if (want > cur) {
+        var up = decodeTargetFor(st, maxS, want, ddS.active);
+        if (up >= 0 && f.dtis[up] === DTI.SWITCH) c.dd_temporal = want;
+      }
+      if (cur !== c.dd_temporal && cur != null) {
+        _diag(c.id + ' decode target temporal ' + cur + ' → ' + c.dd_temporal);
+      }
+    }
+    var t = (c.dd_temporal == null) ? want : c.dd_temporal;
+    var target = decodeTargetFor(st, maxS, t, ddS.active);
+    if (target < 0) return true;              // no target fits: as received
+    return f.dtis[target] !== DTI.NOT_PRESENT;
+  }
+
   function attach_peer_tap(peer) {
     peer._tap = function (rtp, rinfo, info) {
       try { tap_inner(rtp, rinfo, info); }
@@ -1048,12 +1129,25 @@ function Router(options) {
       // that fills a hole we actually saw is a repair the viewer needs as
       // much as we did; it goes on, everything else stops here, and none
       // of it counts as layer liveness or volume.
+      //
+      // A copy of a packet NEWER than any we have seen is neither: the
+      // probe (or a retransmission) carried a packet whose own transmission
+      // is lost or still on its way. mediasoup's NackGenerator lets it
+      // through as a normal packet (ReceivePacket returns true for it), and
+      // so does libwebrtc's receiver. It used to stop here as a probe, while
+      // the transport counted it received and never NACKed it: no viewer
+      // could get it, each one's NACKs found nothing, and its picture froze
+      // until the next keyframe (3 s twice in a 40 s run at 3 % loss).
       if (info.isRtx) {
-        if (!e.holes || !e.holes[seq]) return;
-        delete e.holes[seq];
-        e.hole_count--;
-        forward_to_routes(rtp, info, nowP, seq, true);
-        return;
+        if (e.max_seq == null || seq_delta(seq, e.max_seq) <= 0) {
+          if (!e.holes || !e.holes[seq]) return;
+          delete e.holes[seq];
+          e.hole_count--;
+          forward_to_routes(rtp, info, nowP, seq, true);
+          return;
+        }
+        // Newer: on as primary traffic, below (it is the stream's next
+        // packet, so it counts as one; it opens the holes before it).
       }
 
       // Per-SSRC observation: liveness + volume for every stream this
@@ -1206,6 +1300,42 @@ function Router(options) {
           }
         }
       }
+      // DEPENDENCY DESCRIPTOR (AV1 RTP spec, Appendix A). A producer that
+      // negotiated it (Chrome sends it with a scalabilityMode, mediasoup-
+      // client keeps it for H.264 and AV1) tells the forwarder each
+      // frame's spatial / temporal layer and decode targets without the
+      // payload: H.264 has no temporal id in its payload at all. The
+      // Template Dependency Structure comes with the first packet of each
+      // coded video sequence (A.8.3) and is kept per SSRC (each simulcast
+      // stream has its own); every packet is parsed against it.
+      var dd = null, ddS = null;
+      if (svcP.kind === 'video') {
+        var ddId = producer_ext_id(svcP, DEPENDENCY_DESCRIPTOR_URI);
+        if (ddId != null) {
+          var ddBuf = readExtension(rtp, ddId);
+          if (ddBuf) {
+            if (!peer._dd) peer._dd = {};
+            var ddState = peer._dd[info.ssrc] || (peer._dd[info.ssrc] = { structure: null, active: null });
+            dd = parseDependencyDescriptor(ddBuf, ddState.structure);
+            if (dd && !repair) {
+              if (dd.structure) { ddState.structure = dd.structure; ddState.active = null; }
+              // A.4: an update of the active set holds until the next one.
+              if (dd.activeDecodeTargetsBitmask != null) ddState.active = dd.activeDecodeTargetsBitmask;
+            }
+            ddS = ddState;
+            if (dd && !dd.frame) dd = null;
+            // AV1 SVC: the spatial layer is the descriptor's, and a new
+            // structure starts a coded video sequence (a keyframe), so
+            // the VP9 path's layer switching applies as is.
+            if (dd && !svc && producer_codec_name(svcP).toUpperCase() === 'AV1' && ddState.structure &&
+                ddState.structure.maxSpatialId > 0) {
+              svc = { ok: true, sid: dd.frame.spatialId, start: dd.startOfFrame, end: dd.endOfFrame,
+                      inter: !dd.structure };
+              note_svc_layer(svcP, svc.sid, nowP, rtp.length);
+            }
+          }
+        }
+      }
       // The codec name is needed only if we are going to parse.
       var codecName = (_DBG_KF || needKf || anyCap)
                       ? producer_codec_name(list[0].producer) : '';
@@ -1261,7 +1391,9 @@ function Router(options) {
         // sequence numbers close up over them. Before, a filtered packet
         // left a gap, the viewer NACKed a packet that would never come,
         // and counted it as loss.
-        if (c.preferred_temporal != null && tid != null && tid > c.preferred_temporal) {
+        // (A Dependency Descriptor stream is judged by dd_select instead,
+        // after the spatial layer below.)
+        if (!(dd && ddS.structure) && c.preferred_temporal != null && tid != null && tid > c.preferred_temporal) {
           if (c.fwd && !repair) c.fwd.drop(rtp);
           continue;
         }
@@ -1283,7 +1415,16 @@ function Router(options) {
           // for the rest of a picture that is never coming.
           setMarker = (svc.sid === c.svc_current && svc.end);
         }
-        if (tid != null && tid !== c.current_temporal) {
+        // DECODE TARGET (Dependency Descriptor): the frames of the decode
+        // target at this consumer's spatial layer and temporal ceiling.
+        if (dd && ddS.structure && !dd_select(c, dd, ddS, svc, repair)) {
+          if (c.fwd && !repair) c.fwd.drop(rtp);
+          continue;
+        }
+        if (dd && ddS.structure) {
+          if (c.dd_temporal != null) c.current_temporal = c.dd_temporal;
+          else if (c.current_temporal == null || dd.frame.temporalId > c.current_temporal) c.current_temporal = dd.frame.temporalId;
+        } else if (tid != null && tid !== c.current_temporal) {
           c.current_temporal = tid;
         }
 
@@ -1685,7 +1826,9 @@ function Router(options) {
 
   /* ── Public: addPeer / consume ───────────────────────────────── */
 
-  this.addPeer = function (peer_or_pc) {
+  // options.offerer: see cascade 0 (the peer's first offer waits for its
+  // answer, and no remote offer comes before it).
+  this.addPeer = function (peer_or_pc, options) {
     if (state.closed) throw new Error('Router closed');
 
     var pc = unwrap_pc(peer_or_pc);
@@ -1709,6 +1852,7 @@ function Router(options) {
       pc: pc || null, manager: pc ? pc._manager : null,
       wrapper: (peer_or_pc !== pc) ? peer_or_pc : null,
       closed: false, attached: false,
+      offerer: !!(options && options.offerer),
       _listeners: {}, _tap: null, _pli: null,
       _has_unbound: false, handle: null,
     };
@@ -1770,6 +1914,13 @@ function Router(options) {
     if (peer.attached || peer.closed) return;
     peer.attached = true;
     var pc = peer.pc;
+    // The router forwards RTP it never decodes or encodes: the peer
+    // connection negotiates every codec webrtc-server can packetize, not
+    // only those its media-processing can encode / decode (webrtc-server
+    // codec_support.js; the same as constructing it with
+    // `passthroughCodecs: true`, here for connections made elsewhere —
+    // stable-webrtc's, the application's).
+    if (peer.manager && peer.manager.state) peer.manager.state.passthroughCodecs = true;
 
     // addEventListener — never the on* properties (stable-webrtc owns those).
     peer._listeners.track = function (event) {
@@ -1946,6 +2097,7 @@ function Router(options) {
       preferred_spatial: null, // ceiling set by the app (M3b); null = best available
       preferred_temporal: null,// TID ceiling (M3c); null = all temporal layers
       current_temporal: null,  // highest TID actually forwarded, for reporting
+      dd_temporal: null,       // the temporal ceiling in effect on a Dependency Descriptor stream (dd_select)
       up_since: 0, up_target: null,
       last_pli_at: 0, created_at: Date.now(), cb: cb, closed: false, handle: null,
     };

@@ -465,15 +465,6 @@ function bind_udp_in_range(method, range, ip, cb) {
   })(0);
 }
 
-// A syntactically valid, never-verified fingerprint. Safe by the gate
-// invariant: inbound stays held until connect() installs the client's
-// REAL fingerprint, so no DTLS byte is ever checked against this.
-var PLACEHOLDER_DTLS = {
-  role: 'client',
-  fingerprints: [{ algorithm: 'sha-256',
-    value: 'AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA' }],
-};
-
 var MEDIASOUP_DTLS_TO_SETUP = {
   // The synthesized answer describes THE REMOTE (the mediasoup client),
   // so its a=setup is the CLIENT's own posture. client role 'client'
@@ -508,29 +499,6 @@ function fingerprint_lines(clientDtls) {
   return fps.map(function (f) {
     return 'a=fingerprint:' + f.algorithm + ' ' + f.value;
   });
-}
-
-function build_bootstrap_answer(clientDtls) {
-  // Minimal, honest answer to OUR m=application bootstrap offer. The
-  // client side never sees this SDP — it configures OUR stack only:
-  // the client's fingerprint (so DTLS verifies THEIR cert) and our
-  // setup role derived from THEIR declared role.
-  var role  = (clientDtls && clientDtls.role) || 'auto';
-  var setup = MEDIASOUP_DTLS_TO_SETUP[role] || 'passive';
-  return [
-    'v=0',
-    'o=- ' + Date.now() + ' 2 IN IP4 127.0.0.1',
-    's=-', 't=0 0',
-    'a=group:BUNDLE 0',
-    'a=msid-semantic: WMS',
-    'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
-    'c=IN IP4 0.0.0.0',
-    'a=mid:0',
-    'a=ice-ufrag:msclient',                 // lite agent never uses these —
-    'a=ice-pwd:msclientmsclientmsclient',   // structural placeholders
-  ].concat(fingerprint_lines(clientDtls))
-   .concat(['a=setup:' + setup, 'a=sctp-port:5000', ''])
-   .join('\r\n');
 }
 
 /**
@@ -981,6 +949,11 @@ function Consumer(opts) {
 
   this._layersChanged = function (layers) {
     if (state.closed) return;
+    // mediasoup emits 'layerschange' for simulcast and SVC consumers only:
+    // "Simple consumers and pipes have no layers concept" (worker
+    // Consumer.cpp). A single-encoding consumer that announced {0, 0}
+    // showed a layer indicator the real server never shows.
+    if (!has_layers()) return;
     // NOTE: currentLayers is NOT cached here. The getter asks the engine
     // every time, because the engine can switch layers between events —
     // a cached value would be stale exactly when an app checks it after
@@ -997,8 +970,15 @@ function Consumer(opts) {
   Object.defineProperty(this, 'preferredLayers', {
     get: function () { return state.preferredLayers || undefined; },
   });
+  // Simple and pipe consumers have no layers (mediasoup: currentLayers stays
+  // undefined, setPreferredLayers answers with no preferred layers).
+  function has_layers() {
+    var t = self.type;
+    return t !== 'simple' && t !== 'pipe';
+  }
   Object.defineProperty(this, 'currentLayers', {
     get: function () {
+      if (!has_layers()) return undefined;
       if (state.closed || state.paused || state.producerPaused) return null;
       var h = state.sfuHandle;
       if (!h) return null;
@@ -1144,6 +1124,9 @@ function Consumer(opts) {
     var sp = (layers.spatialLayer == null) ? null : (layers.spatialLayer | 0);
     var tp = (layers.temporalLayer == null) ? null : (layers.temporalLayer | 0);
     if (state.closed) return Promise.reject(InvalidStateError('Consumer closed'));
+    // mediasoup accepts the request on a simple or pipe consumer and keeps
+    // preferredLayers undefined (the worker's response carries none).
+    if (!has_layers()) { state.preferredLayers = null; return Promise.resolve(); }
     state.preferredLayers = { spatialLayer: sp, temporalLayer: tp };
     var h = state.sfuHandle;
     if (h && typeof h.setPreferredSpatialLayer === 'function') {
@@ -1648,6 +1631,10 @@ function DataConsumer(opts) {
  *  WebRtcTransport
  * ═══════════════════════════════════════════════════════════════════ */
 
+// mediasoup's worker (Transport.cpp DefaultInitialAvailableOutgoingBitrate):
+// where a transport's outgoing estimate starts when the app names nothing.
+var DEFAULT_INITIAL_AVAILABLE_OUTGOING_BITRATE = 600000;
+
 function WebRtcTransport(opts, cb) {
   var self = this;
   var ev = new EventEmitter();
@@ -1788,8 +1775,11 @@ function WebRtcTransport(opts, cb) {
   state.preferTcp = !!opts.preferTcp;
   state.tcpPort = null;
   state.tcpAnnounced = null;
+  // passthroughCodecs: the transport forwards RTP, never decodes or
+  // encodes it, so every codec webrtc-server packetizes is negotiable
+  // (not only those its media-processing can encode / decode).
   if (webRtcServer) {
-    state.pc = new RTCPeerConnection({ router: webRtcServer._webrtcRouter });
+    state.pc = new RTCPeerConnection({ router: webRtcServer._webrtcRouter, passthroughCodecs: true, startBitrate: opts.initialAvailableOutgoingBitrate });
     state.port = webRtcServer.port;
     state.tcpPort = webRtcServer._tcpPort;          // null: the server has no tcp entry
     state.tcpAnnounced = webRtcServer._tcpAnnounced;
@@ -1817,8 +1807,8 @@ function WebRtcTransport(opts, cb) {
       // RACE KILLER (found live as flaky media/disconnects): Chrome
       // fires its DTLS ClientHello the instant ICE completes, sometimes
       // BEFORE our connect-time renegotiation installs the client's REAL
-      // fingerprint — so verification ran against the placeholder and the
-      // handshake died (or survived only via retransmit luck). Chrome
+      // fingerprint — so the handshake ran before the stack had it and
+      // died (or survived only via retransmit luck). Chrome
       // cannot finish ICE without OUR check responses, so we simply hold
       // ALL inbound until the real fingerprint is in place. STUN/DTLS
       // retransmissions make the dropped packets free.
@@ -1829,7 +1819,7 @@ function WebRtcTransport(opts, cb) {
       });
 
       if (!state.enableTcp || !opts.tcpPortRange) {
-        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr });
+        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr, passthroughCodecs: true, startBitrate: opts.initialAvailableOutgoingBitrate });
         return after_pc_ready(opts.announcedAddresses);
       }
 
@@ -1846,7 +1836,7 @@ function WebRtcTransport(opts, cb) {
         // connections created after tcp() (made the other way round, Chrome's
         // TCP checks arrived and no response could go back on the connection).
         var handle = wr.tcp({ port: state.tcpPort });
-        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr });
+        state.pc = new RTCPeerConnection({ mode: 'lite', router: wr, passthroughCodecs: true, startBitrate: opts.initialAvailableOutgoingBitrate });
         state.heldTcp = [];
         state.releaseTcp = function () {
           var held = state.heldTcp; state.heldTcp = [];
@@ -2223,7 +2213,7 @@ function WebRtcTransport(opts, cb) {
     // THE BRIDGE: this pc joins the SFU router as a first-class peer.
     // Its track events auto-create engine producers and its transceivers
     // are what consumers are built on. One engine, two front doors.
-    state.sfuPeer = router._sfuRouter.addPeer(pc);
+    state.sfuPeer = router._sfuRouter.addPeer(pc, { offerer: true });
 
     run_bootstrap(announced);
   }
@@ -2253,18 +2243,17 @@ function WebRtcTransport(opts, cb) {
       state.iceParameters  = { usernameFragment: p.ufrag, password: p.pwd, iceLite: true };
       state.dtlsParameters = { role: 'auto', fingerprints: [p.fingerprint] };
 
-      // Reach STABLE at birth (found live: a transport waiting in
-      // have-local-offer starves cascade 0 — consumer records existed but
-      // no transceivers were ever added). Real mediasoup has no SDP state
-      // machine to block on; we emulate that by answering our own
-      // bootstrap with a PLACEHOLDER fingerprint. The client's REAL
-      // fingerprint replaces it at connect, and DTLS verifies against the
-      // LATEST remote description at handshake time — always after
-      // connect. setup:active here fixes our role early (we stay
-      // passive/server) so the later renegotiation agrees with it.
-      return pc.setRemoteDescription(new RTCSessionDescription({
-        type: 'answer', sdp: build_bootstrap_answer(PLACEHOLDER_DTLS),
-      }));
+      // The offer stays OUTSTANDING until connect(): its answer is the
+      // client's, and only connect() brings the client's DTLS parameters.
+      // A placeholder answer here (an invented fingerprint, the real one
+      // swapped in at connect) was a DTLS fingerprint change without an
+      // ICE restart, which RFC 9429 5.11 / 5.8.3 and RFC 8842 forbid; the
+      // stack now refuses it (webrtc-server-rs PORTING.md bug 84), and
+      // every transport failed at connect. A restart cannot fix it: it
+      // would rotate the ICE credentials the client already has. Until
+      // connect every renegotiation is a re-offer in have-local-offer
+      // (RFC 9429 5.2.2), and the engine adds consumers' m-lines to it
+      // (addPeer { offerer: true }, cascade 0).
     }).then(function () {
       _diag('transport ' + state.id + ' ready — ' + state.iceCandidates.length + ' candidates');
       cb(null, self);
@@ -2319,15 +2308,14 @@ function WebRtcTransport(opts, cb) {
     // its 'connect' event once the app calls recvTransport.consume()
     // with the parameters this very renegotiation produces. Blocking on
     // clientDtls here deadlocked the entire receive direction. So:
-    // before connect, the synthesized answer carries the same
-    // PLACEHOLDER fingerprint the bootstrap uses — safe under the gate
-    // invariant (no inbound byte is processed until the real
-    // fingerprint is installed), and connect() re-renegotiates with the
-    // real one the moment it arrives.
-    var dtls = state.clientDtls || PLACEHOLDER_DTLS;
+    // before connect, a re-offer only (the m-line, its mid and ssrc are
+    // committed by setLocalDescription); connect() answers it with the
+    // client's real fingerprint and role, the first remote description.
+    var dtls = state.clientDtls;
     return until_closed(pc.createOffer()
       .then(function (offer) { return pc.setLocalDescription(offer); })
       .then(function () {
+        if (!dtls) return;
         var producedByMid = {};
         state.produceSections.forEach(function (sec) {
           var mm = sec && /a=mid:(\S+)/.exec(sec);
@@ -2348,11 +2336,11 @@ function WebRtcTransport(opts, cb) {
     if (!dtls) return Promise.reject(new TypeError('connect: dtlsParameters required'));
     state.clientDtls = dtls;
 
-    // The pc is already stable (placeholder bootstrap). Run a full
-    // renegotiation that (a) carries any transceivers added meanwhile
-    // and (b) installs the client's REAL fingerprint — and only THEN
-    // open the inbound gate, so the first DTLS byte we ever process
-    // verifies against the real thing. Deterministic by construction:
+    // The pc still waits in have-local-offer (see run_bootstrap). A
+    // last re-offer carries any transceivers added meanwhile and its
+    // answer, the first remote description, the client's fingerprint and
+    // role — and only THEN open the inbound gate, so the first DTLS byte
+    // we ever process verifies against it. Deterministic by construction:
     // no ICE completion → no ClientHello → no race.
     return renegotiate().then(function () {
       state.inboundGated = false;
@@ -3345,9 +3333,16 @@ function Router(options, workerSettings) {
     if (!enableUdp && !enableTcp) {
       return Promise.reject(new TypeError('createWebRtcTransport: at least one of enableUdp and enableTcp must be true'));
     }
+    // mediasoup: "if given, initialAvailableOutgoingBitrate must be an
+    // unsigned integer"; unset, the worker starts its estimate at 600 kbps.
+    var iaob = opts.initialAvailableOutgoingBitrate;
+    if (iaob !== undefined && !(Number.isSafeInteger(iaob) && iaob >= 0)) {
+      return Promise.reject(new TypeError('if given, initialAvailableOutgoingBitrate must be an unsigned integer'));
+    }
     return new Promise(function (resolve, reject) {
       var t = new WebRtcTransport({
         router: self,
+        initialAvailableOutgoingBitrate: iaob !== undefined ? iaob : DEFAULT_INITIAL_AVAILABLE_OUTGOING_BITRATE,
         webRtcServer: opts.webRtcServer || null,
         portRange: port_range_of(udpInfo, opts.port),
         bindIp: bind_ip_of(udpInfos),
